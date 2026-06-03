@@ -756,14 +756,16 @@ pub struct SrtLogEvent<'a> {
 mod test {
     use super::*;
     use std::{
+        convert::TryInto,
+        net::UdpSocket,
         panic::panic_any,
         ptr::null_mut,
         sync::{
-            atomic::{AtomicU32, Ordering},
-            mpsc,
+            atomic::{AtomicBool, AtomicU32, Ordering},
+            mpsc, Arc, Mutex,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -786,6 +788,101 @@ mod test {
         assert_eq!(conn.id(), None);
 
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_client_server_recovers_burst_loss_through_latency_proxy_matrix() {
+        let scenarios = [
+            SrtLossScenario {
+                name: "keyframe-burst",
+                payload_len: 40_000,
+                drop_client_data_indices: contiguous_data_indices(3, 8),
+            },
+            SrtLossScenario {
+                name: "keyframe-late-burst",
+                payload_len: 64_000,
+                drop_client_data_indices: contiguous_data_indices(19, 10),
+            },
+            SrtLossScenario {
+                name: "delta-burst",
+                payload_len: 18_000,
+                drop_client_data_indices: contiguous_data_indices(4, 3),
+            },
+        ];
+
+        for scenario in &scenarios {
+            let result = run_srt_loss_scenario(scenario);
+
+            assert_eq!(
+                result.proxy_stats.dropped_client_data_packets,
+                scenario.drop_client_data_indices.len(),
+                "{} proxy drop count mismatch",
+                scenario.name
+            );
+            assert!(
+                result.proxy_stats.client_to_server_packets > result.proxy_stats.dropped_client_data_packets,
+                "{} proxy should forward later client packets and SRT retransmissions",
+                scenario.name
+            );
+            assert!(
+                result.proxy_stats.server_to_client_packets > 0,
+                "{} proxy should carry SRT handshake/feedback from server to client",
+                scenario.name
+            );
+            assert!(
+                result.client_stats.pktRetransTotal > 0 || result.client_stats.byteRetransTotal > 0,
+                "{} SRT sender should retransmit dropped packets: {:?}",
+                scenario.name,
+                result.client_stats
+            );
+            assert!(
+                result.server_stats.pktRcvLossTotal > 0 || result.server_stats.pktRcvRetrans > 0,
+                "{} SRT receiver should observe loss or retransmitted packets: {:?}",
+                scenario.name,
+                result.server_stats
+            );
+            assert!(
+                result.read_elapsed > Duration::from_millis(33),
+                "{} SRT ARQ recovered the payload, but should miss a 33 ms video playout deadline over the simulated 70 ms RTT",
+                scenario.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_server_recovers_sustained_video_stream_through_latency_proxy() {
+        let scenario = SrtStreamScenario::video_scorecard();
+        let result = run_srt_stream_scenario(&scenario);
+
+        assert_eq!(result.frames_sent, 30);
+        assert_eq!(result.frames_recovered, result.frames_sent);
+        assert!(result.lost_frames >= 8, "SRT sustained stream should exercise repeated video-frame losses");
+        assert_eq!(
+            result.feedback_missed_frames, result.lost_frames,
+            "every lost frame should miss the 33 ms low-latency deadline before SRT retransmission arrives"
+        );
+        assert_eq!(
+            result.proxy_stats.dropped_client_data_packets, result.dropped_packets,
+            "SRT sustained stream proxy drop count mismatch"
+        );
+        assert!(
+            result.proxy_stats.client_to_server_packets > result.proxy_stats.dropped_client_data_packets,
+            "proxy should forward later client packets and SRT retransmissions"
+        );
+        assert!(
+            result.client_stats.pktRetransTotal > 0 || result.client_stats.byteRetransTotal > 0,
+            "SRT sender should retransmit sustained stream packet losses: {:?}",
+            result.client_stats
+        );
+        assert!(
+            result.server_stats.pktRcvLossTotal > 0 || result.server_stats.pktRcvRetrans > 0,
+            "SRT receiver should observe sustained stream loss or retransmits: {:?}",
+            result.server_stats
+        );
+        assert!(
+            result.read_elapsed > Duration::from_millis(33),
+            "SRT sustained stream ARQ recovered the payload, but should miss a 33 ms video playout deadline over the simulated 70 ms RTT"
+        );
     }
 
     #[test]
@@ -833,6 +930,402 @@ mod test {
         let (sockaddr, socklen) = to_sockaddr(&addr);
         let round_tripped = sockaddr_from_storage(&sockaddr, socklen).unwrap();
         assert_eq!(addr, round_tripped);
+    }
+
+    #[derive(Debug, Clone)]
+    struct SrtLossScenario {
+        name: &'static str,
+        payload_len: usize,
+        drop_client_data_indices: Vec<usize>,
+    }
+
+    #[derive(Debug)]
+    struct SrtLossScenarioResult {
+        proxy_stats: SrtUdpProxyStats,
+        client_stats: sys::SRT_TRACEBSTATS,
+        server_stats: sys::SRT_TRACEBSTATS,
+        read_elapsed: Duration,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SrtStreamFrame {
+        payload_len: usize,
+        drop_chunk_start: usize,
+        drop_chunk_len: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SrtStreamScenario {
+        name: &'static str,
+        frames: Vec<SrtStreamFrame>,
+    }
+
+    #[derive(Debug)]
+    struct SrtStreamScenarioResult {
+        proxy_stats: SrtUdpProxyStats,
+        client_stats: sys::SRT_TRACEBSTATS,
+        server_stats: sys::SRT_TRACEBSTATS,
+        read_elapsed: Duration,
+        frames_sent: usize,
+        frames_recovered: usize,
+        lost_frames: usize,
+        feedback_missed_frames: usize,
+        dropped_packets: usize,
+    }
+
+    impl SrtStreamScenario {
+        fn video_scorecard() -> Self {
+            let mut frames = Vec::new();
+            for frame_index in 0..30 {
+                if frame_index == 0 {
+                    frames.push(SrtStreamFrame {
+                        payload_len: 40_000,
+                        drop_chunk_start: 3,
+                        drop_chunk_len: 8,
+                    });
+                } else if frame_index % 9 == 0 {
+                    frames.push(SrtStreamFrame {
+                        payload_len: 18_000,
+                        drop_chunk_start: 4,
+                        drop_chunk_len: 3,
+                    });
+                } else if frame_index % 5 == 0 {
+                    frames.push(SrtStreamFrame {
+                        payload_len: 18_000,
+                        drop_chunk_start: 5,
+                        drop_chunk_len: 2,
+                    });
+                } else {
+                    frames.push(SrtStreamFrame {
+                        payload_len: 18_000,
+                        drop_chunk_start: 0,
+                        drop_chunk_len: 0,
+                    });
+                }
+            }
+            Self {
+                name: "sustained-video-scorecard",
+                frames,
+            }
+        }
+    }
+
+    fn run_srt_loss_scenario(scenario: &SrtLossScenario) -> SrtLossScenarioResult {
+        let payload = video_like_payload(scenario.payload_len);
+        let outcome = run_srt_payload_over_lossy_proxy(scenario.name, payload.clone(), scenario.drop_client_data_indices.clone());
+
+        assert_eq!(outcome.received_payload, payload, "{} recovered payload mismatch", scenario.name);
+
+        SrtLossScenarioResult {
+            proxy_stats: outcome.proxy_stats,
+            client_stats: outcome.client_stats,
+            server_stats: outcome.server_stats,
+            read_elapsed: outcome.read_elapsed,
+        }
+    }
+
+    fn run_srt_stream_scenario(scenario: &SrtStreamScenario) -> SrtStreamScenarioResult {
+        let mut payload = Vec::new();
+        let mut expected_payloads = Vec::new();
+        let mut drop_client_data_indices = Vec::new();
+        let mut next_data_packet_index = 1usize;
+        let mut lost_frames = 0usize;
+        let mut feedback_missed_frames = 0usize;
+
+        for (frame_index, frame) in scenario.frames.iter().enumerate() {
+            let frame_payload = video_like_payload(frame.payload_len);
+            let framed = frame_stream_record(frame_index as u32, &frame_payload);
+            let chunk_count = framed.len().div_ceil(1316);
+            let frame_drop_indices = if frame.drop_chunk_len == 0 {
+                Vec::new()
+            } else {
+                let start = next_data_packet_index + frame.drop_chunk_start.saturating_sub(1);
+                contiguous_data_indices(start, frame.drop_chunk_len)
+            };
+            if !frame_drop_indices.is_empty() {
+                lost_frames += 1;
+                if !feedback_only_can_recover_before_deadline(frame_drop_indices.len(), 70, 0, 33) {
+                    feedback_missed_frames += 1;
+                }
+            }
+            drop_client_data_indices.extend(frame_drop_indices);
+            next_data_packet_index += chunk_count;
+            payload.extend_from_slice(&framed);
+            expected_payloads.push(frame_payload);
+        }
+
+        let outcome = run_srt_payload_over_lossy_proxy(scenario.name, payload.clone(), drop_client_data_indices.clone());
+        assert_eq!(outcome.received_payload, payload, "{} recovered stream payload mismatch", scenario.name);
+        let recovered_frames =
+            decode_frame_stream(&outcome.received_payload).unwrap_or_else(|error| panic!("{} frame stream decode failed: {}", scenario.name, error));
+        assert_eq!(recovered_frames, expected_payloads, "{} recovered frame payload mismatch", scenario.name);
+
+        SrtStreamScenarioResult {
+            proxy_stats: outcome.proxy_stats,
+            client_stats: outcome.client_stats,
+            server_stats: outcome.server_stats,
+            read_elapsed: outcome.read_elapsed,
+            frames_sent: scenario.frames.len(),
+            frames_recovered: recovered_frames.len(),
+            lost_frames,
+            feedback_missed_frames,
+            dropped_packets: drop_client_data_indices.len(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct SrtPayloadOutcome {
+        received_payload: Vec<u8>,
+        proxy_stats: SrtUdpProxyStats,
+        client_stats: sys::SRT_TRACEBSTATS,
+        server_stats: sys::SRT_TRACEBSTATS,
+        read_elapsed: Duration,
+    }
+
+    fn run_srt_payload_over_lossy_proxy(scenario_name: &str, payload: Vec<u8>, drop_client_data_indices: Vec<usize>) -> SrtPayloadOutcome {
+        let expected_len = payload.len();
+        let listener = Listener::bind_with_options(
+            "127.0.0.1:0",
+            [
+                ListenerOption::TimestampBasedPacketDeliveryMode(false),
+                ListenerOption::TooLatePacketDrop(false),
+                ListenerOption::PeerLatency(120),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{} bind listener failed: {}", scenario_name, error));
+        listener
+            .socket
+            .set(sys::SRT_SOCKOPT_SRTO_RCVTIMEO, 8_000i32)
+            .unwrap_or_else(|error| panic!("{} set listener timeout failed: {}", scenario_name, error));
+        let server_addr = listener
+            .socket
+            .socket_addr()
+            .unwrap_or_else(|error| panic!("{} listener socket addr failed: {}", scenario_name, error));
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("{} bind proxy failed: {}", scenario_name, error));
+        let proxy_addr = proxy_socket
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{} proxy addr failed: {}", scenario_name, error));
+        let stop_proxy = Arc::new(AtomicBool::new(false));
+        let proxy_stats = Arc::new(Mutex::new(SrtUdpProxyStats::default()));
+        let proxy_thread = spawn_lossy_srt_udp_proxy(
+            proxy_socket,
+            server_addr,
+            Arc::clone(&stop_proxy),
+            Arc::clone(&proxy_stats),
+            SrtUdpProxyConfig {
+                drop_client_data_indices,
+                one_way_delay: Duration::from_millis(35),
+            },
+        );
+        let (server_tx, server_rx) = mpsc::sync_channel(1);
+        let server_thread = thread::spawn(move || {
+            let result: std::result::Result<(Vec<u8>, sys::SRT_TRACEBSTATS, Duration), String> = (|| {
+                let (mut conn, _) = listener.accept().map_err(|error| error.to_string())?;
+                conn.socket.set(sys::SRT_SOCKOPT_SRTO_RCVTIMEO, 8_000i32).map_err(|error| error.to_string())?;
+
+                let mut received = Vec::with_capacity(expected_len);
+                let mut buf = [0_u8; 2048];
+                let read_started = Instant::now();
+                while received.len() < expected_len {
+                    let len = conn.read(&mut buf).map_err(|error| error.to_string())?;
+                    if len == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buf[..len]);
+                }
+                let elapsed = read_started.elapsed();
+                let stats = conn.raw_stats(false, false).map_err(|error| error.to_string())?;
+                Ok((received, stats, elapsed))
+            })();
+            server_tx.send(result).unwrap();
+        });
+
+        let mut conn = Stream::connect(
+            proxy_addr,
+            &ConnectOptions {
+                timestamp_based_packet_delivery_mode: Some(false),
+                too_late_packet_drop: Some(false),
+                max_send_payload_size: Some(1316),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{} connect through proxy failed: {}", scenario_name, error));
+        conn.socket
+            .set(sys::SRT_SOCKOPT_SRTO_SNDTIMEO, 8_000i32)
+            .unwrap_or_else(|error| panic!("{} set send timeout failed: {}", scenario_name, error));
+        for chunk in payload.chunks(1316) {
+            conn.write_all(chunk)
+                .unwrap_or_else(|error| panic!("{} write failed: {}", scenario_name, error));
+        }
+
+        let (received, server_stats, read_elapsed) = server_rx
+            .recv_timeout(Duration::from_secs(12))
+            .unwrap_or_else(|error| panic!("{} server timed out: {}", scenario_name, error))
+            .unwrap_or_else(|error| panic!("{} server failed: {}", scenario_name, error));
+        let client_stats = conn
+            .raw_stats(false, false)
+            .unwrap_or_else(|error| panic!("{} client stats failed: {}", scenario_name, error));
+
+        stop_proxy.store(true, Ordering::SeqCst);
+        proxy_thread.join().unwrap_or_else(|_| panic!("{} proxy thread panicked", scenario_name));
+        server_thread.join().unwrap_or_else(|_| panic!("{} server thread panicked", scenario_name));
+        let proxy_stats = proxy_stats.lock().unwrap().clone();
+
+        SrtPayloadOutcome {
+            received_payload: received,
+            proxy_stats,
+            client_stats,
+            server_stats,
+            read_elapsed,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct SrtUdpProxyConfig {
+        drop_client_data_indices: Vec<usize>,
+        one_way_delay: Duration,
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct SrtUdpProxyStats {
+        client_to_server_packets: usize,
+        server_to_client_packets: usize,
+        client_data_packets: usize,
+        dropped_client_data_packets: usize,
+    }
+
+    fn spawn_lossy_srt_udp_proxy(
+        socket: UdpSocket,
+        server_addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        stats: Arc<Mutex<SrtUdpProxyStats>>,
+        config: SrtUdpProxyConfig,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            socket.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let mut local_stats = SrtUdpProxyStats::default();
+            let mut client_addr = None;
+            let mut buf = [0_u8; 2048];
+
+            while !stop.load(Ordering::SeqCst) {
+                let (len, peer) = match socket.recv_from(&mut buf) {
+                    Ok(packet) => packet,
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+
+                let from_server = peer == server_addr;
+                let target = if from_server {
+                    local_stats.server_to_client_packets += 1;
+                    match client_addr {
+                        Some(addr) => addr,
+                        None => continue,
+                    }
+                } else {
+                    local_stats.client_to_server_packets += 1;
+                    if client_addr.is_none() {
+                        client_addr = Some(peer);
+                    }
+                    server_addr
+                };
+
+                if !from_server && is_srt_data_packet(&buf[..len]) {
+                    local_stats.client_data_packets += 1;
+                    let data_index = local_stats.client_data_packets;
+                    if config.drop_client_data_indices.contains(&data_index) {
+                        local_stats.dropped_client_data_packets += 1;
+                        continue;
+                    }
+                }
+
+                forward_udp_packet_with_delay(&socket, target, buf[..len].to_vec(), config.one_way_delay);
+            }
+
+            *stats.lock().unwrap() = local_stats;
+        })
+    }
+
+    fn is_srt_data_packet(packet: &[u8]) -> bool {
+        packet.first().is_some_and(|first| first & 0x80 == 0)
+    }
+
+    fn forward_udp_packet_with_delay(socket: &UdpSocket, target: SocketAddr, packet: Vec<u8>, delay: Duration) {
+        let socket = socket.try_clone().expect("clone UDP proxy socket");
+        thread::spawn(move || {
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            let _ = socket.send_to(&packet, target);
+        });
+    }
+
+    fn contiguous_data_indices(start: usize, len: usize) -> Vec<usize> {
+        (start..start.saturating_add(len)).collect()
+    }
+
+    fn feedback_only_can_recover_before_deadline(lost_packets: usize, rtt_ms: u32, feedback_interval_ms: u32, frame_deadline_ms: u32) -> bool {
+        lost_packets == 0 || rtt_ms.saturating_add(feedback_interval_ms) <= frame_deadline_ms
+    }
+
+    fn frame_stream_record(sequence: u32, payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(12 + payload.len());
+        record.extend_from_slice(b"SRTF");
+        record.extend_from_slice(&sequence.to_le_bytes());
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        record.extend_from_slice(payload);
+        record
+    }
+
+    fn decode_frame_stream(bytes: &[u8]) -> std::result::Result<Vec<Vec<u8>>, String> {
+        let mut frames = Vec::new();
+        let mut cursor = 0usize;
+        let mut expected_sequence = 0u32;
+
+        while cursor < bytes.len() {
+            if bytes.len() - cursor < 12 {
+                return Err(format!("truncated frame header at byte {}", cursor));
+            }
+            if &bytes[cursor..cursor + 4] != b"SRTF" {
+                return Err(format!("bad frame magic at byte {}", cursor));
+            }
+
+            let sequence = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+            if sequence != expected_sequence {
+                return Err(format!("frame sequence {} arrived after {}", sequence, expected_sequence));
+            }
+            let payload_len = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            cursor += 12;
+
+            let payload_end = cursor
+                .checked_add(payload_len)
+                .ok_or_else(|| format!("frame {} payload length overflow", sequence))?;
+            if payload_end > bytes.len() {
+                return Err(format!(
+                    "frame {} payload truncated: need {} bytes, have {}",
+                    sequence,
+                    payload_len,
+                    bytes.len().saturating_sub(cursor)
+                ));
+            }
+
+            frames.push(bytes[cursor..payload_end].to_vec());
+            cursor = payload_end;
+            expected_sequence = expected_sequence.saturating_add(1);
+        }
+
+        Ok(frames)
+    }
+
+    fn video_like_payload(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| {
+                let luma = index.wrapping_mul(37) ^ (index.rotate_left(3));
+                let nal_hint = if index % 4096 == 0 { 0x65 } else { 0x41 };
+                (luma as u8).wrapping_add(nal_hint)
+            })
+            .collect()
     }
 
     #[test]
