@@ -658,19 +658,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "h264"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "criterion",
- "memchr",
-]
-
-[[package]]
 name = "h265"
 version = "0.1.0"
 dependencies = [
- "h264",
+ "wavey-h264",
 ]
 
 [[package]]
@@ -1040,7 +1031,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "criterion",
- "h264",
  "h265",
  "mpeg2",
  "mpeg4",
@@ -1049,6 +1039,7 @@ dependencies = [
  "tempdir",
  "tokio",
  "vecmap-rs",
+ "wavey-h264",
 ]
 
 [[package]]
@@ -1431,8 +1422,8 @@ name = "rfc6381"
 version = "0.1.0"
 dependencies = [
  "ffmpeg",
- "h264",
  "h265",
+ "wavey-h264",
 ]
 
 [[package]]
@@ -1637,19 +1628,6 @@ checksum = "64a4a911eed85daf18834cfaa86a79b7d266ff93ff5ba14005426219480ed662"
 dependencies = [
  "libc",
  "winapi",
-]
-
-[[package]]
-name = "srt"
-version = "0.1.0"
-dependencies = [
- "lazy_static",
- "libc",
- "log",
- "num-derive",
- "num-traits",
- "srt-sys",
- "tokio",
 ]
 
 [[package]]
@@ -2024,9 +2002,9 @@ dependencies = [
  "core-foundation 0.1.0",
  "core-media",
  "core-video",
- "h264",
  "textwrap 0.16.0",
  "tracing",
+ "wavey-h264",
 ]
 
 [[package]]
@@ -2120,6 +2098,28 @@ name = "wasm-bindgen-shared"
 version = "0.2.84"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0046fef7e28c3804e5e38bfa31ea2a0f73905319b677e57ebe37e49358989b5d"
+
+[[package]]
+name = "wavey-h264"
+version = "0.1.1"
+dependencies = [
+ "bytes",
+ "criterion",
+ "memchr",
+]
+
+[[package]]
+name = "wavey-srt"
+version = "0.1.0"
+dependencies = [
+ "lazy_static",
+ "libc",
+ "log",
+ "num-derive",
+ "num-traits",
+ "srt-sys",
+ "tokio",
+]
 
 [[package]]
 name = "web-sys"
@@ -2407,9 +2407,9 @@ name = "xcoder-logan"
 version = "0.1.0"
 dependencies = [
  "av-traits",
- "h264",
  "scopeguard",
  "snafu",
+ "wavey-h264",
  "xcoder-logan-259-sys",
  "xcoder-logan-310-sys",
 ]
@@ -2438,12 +2438,12 @@ dependencies = [
  "av-traits",
  "bytemuck",
  "enum-repr",
- "h264",
  "h265",
  "libc",
  "rayon",
  "scopeguard",
  "snafu",
+ "wavey-h264",
  "xcoder-quadra-sys",
 ]
 
@@ -2461,9 +2461,9 @@ name = "xilinx"
 version = "0.1.0"
 dependencies = [
  "bindgen 0.70.1",
- "h264",
  "h265",
  "libloading 0.8.3",
  "scopeguard",
  "simple-error",
+ "wavey-h264",
 ]
