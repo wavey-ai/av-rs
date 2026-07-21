@@ -3,6 +3,9 @@ name = "srt-sys"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
+license = "MIT"
+description = "Native bindings for the Secure Reliable Transport library"
+repository = "https://github.com/wavey-ai/av-rs"
 
 [features]
 default = []

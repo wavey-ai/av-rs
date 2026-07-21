@@ -1,7 +1,10 @@
 [package]
-name = "srt"
+name = "wavey-srt"
 version = "0.1.0"
 edition = "2018"
+license = "MIT"
+description = "Safe Rust bindings for Secure Reliable Transport"
+repository = "https://github.com/wavey-ai/av-rs"
 
 [features]
 default = []
@@ -14,4 +17,4 @@ lazy_static = "1.4.0"
 num-derive = "0.4"
 num-traits = "0.2"
 tokio = { version = "1.0", features = ["macros", "io-util", "rt-multi-thread"], optional = true }
-srt-sys = { path = "srt-sys" }
+srt-sys = "0.1.0"

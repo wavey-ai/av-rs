@@ -8,6 +8,6 @@ default = []
 ffmpeg = ["dep:ffmpeg"]
 
 [dependencies]
-h264 = { path = "../h264" }
+h264 = { package = "wavey-h264", path = "../h264" }
 h265 = { path = "../h265" }
 ffmpeg = { path = "../ffmpeg", features = ["avcodec"], optional = true }

@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
-h264 = { path = "../h264" }
+h264 = { package = "wavey-h264", path = "../h264" }

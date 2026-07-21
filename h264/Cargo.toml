@@ -1,7 +1,10 @@
 [package]
-name = "h264"
+name = "wavey-h264"
 version = "0.1.0"
 edition = "2018"
+license = "MIT"
+description = "H.264 Annex B parsing primitives for Wavey media services"
+repository = "https://github.com/wavey-ai/av-rs"
 
 [dependencies]
 bytes = "1.0"
