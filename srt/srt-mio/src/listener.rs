@@ -142,13 +142,13 @@ impl SrtListener {
 
     pub fn recv_with<F: FnMut(&Delivered<'_>)>(&mut self, id: u32, now: Instant, mut f: F) -> usize {
         let Some(s) = self.conns.get_mut(&id) else { return 0 };
+        // reading may drop too-late packets and so move the deadline even
+        // when nothing is delivered
+        mark(&mut self.dirty, id, s);
         let mut n = 0;
         while let Some(m) = s.conn.recv_message(now) {
             f(&m);
             n += 1;
-        }
-        if n > 0 {
-            mark(&mut self.dirty, id, s);
         }
         n
     }

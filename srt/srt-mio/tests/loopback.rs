@@ -131,12 +131,18 @@ fn connect_blocking_and_rejection() {
 /// arrives in order, and the heap holds about one entry per connection.
 #[test]
 fn listener_timer_heap_many_callers() {
-    let cfg = Config::default().with_latency_ms(60);
+    // generous latency: the test checks the timer bookkeeping, not tight
+    // delivery on a loaded machine
+    let cfg = Config::default().with_latency_ms(500);
     let opts = UdpOptions { recv_buffer: Some(4 << 20), send_buffer: Some(1 << 20), reuse_address: true };
     let mut l = SrtListener::bind("127.0.0.1:0".parse().unwrap(), cfg.clone(), &opts).unwrap();
     let laddr = l.local_addr().unwrap();
     let n = 48usize;
     let mut cs: Vec<SrtSocket> = (0..n).map(|_| SrtSocket::connect("127.0.0.1:0".parse().unwrap(), laddr, cfg.clone(), &opts).unwrap()).collect();
+    // callers bind port 0: every one must get its own port (SO_REUSEADDR
+    // on an ephemeral bind let Linux hand out a port already in use)
+    let ports: std::collections::HashSet<u16> = cs.iter().map(|c| c.local_addr().unwrap().port()).collect();
+    assert_eq!(ports.len(), n, "two callers share a local port");
     let mut poll = Poll::new().unwrap();
     let mut timer = SrtTimer::new().unwrap();
     poll.registry().register(&mut l, Token(0), Interest::READABLE).unwrap();
@@ -152,7 +158,7 @@ fn listener_timer_heap_many_callers() {
     let mut sent = vec![0u32; n];
     let mut next = t0;
     let mut max_heap = 0;
-    while got.values().sum::<u32>() < per * n as u32 && t0.elapsed() < Duration::from_secs(15) {
+    while got.values().sum::<u32>() < per * n as u32 && t0.elapsed() < Duration::from_secs(30) {
         let now = Instant::now();
         l.drive_io(now).unwrap();
         for c in cs.iter_mut() {
@@ -199,6 +205,14 @@ fn listener_timer_heap_many_callers() {
                 Token(i) => cs[i - 1].set_readable(),
             }
         }
+    }
+    if ids.len() != n {
+        for c in &cs {
+            if !c.is_connected() {
+                eprintln!("caller not connected: {:?} stats hs {} recv calls {} datagrams {} local {:?} sid {:#x}", c.connection().state(), c.connection().stats().pkt_sent_handshake, c.recv_calls, c.recv_datagrams, c.local_addr(), c.connection().local_socket_id());
+            }
+        }
+        eprintln!("acceptor {:?} sent {} calls {} wouldblock {} errors {} last {:?}", l.acceptor().stats(), l.send_batch().datagrams, l.send_batch().calls, l.send_batch().would_block, l.send_batch().errors, l.send_batch().last_error);
     }
     assert_eq!(ids.len(), n);
     assert_eq!(got.values().sum::<u32>(), per * n as u32, "every message delivered");

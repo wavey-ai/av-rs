@@ -32,6 +32,8 @@ pub struct UdpOptions {
     pub recv_buffer: Option<usize>,
     /// SO_SNDBUF request.
     pub send_buffer: Option<usize>,
+    /// SO_REUSEADDR, applied only when binding a fixed port (never to an
+    /// ephemeral port-0 bind, where it lets Linux reuse a port in use).
     pub reuse_address: bool,
 }
 
