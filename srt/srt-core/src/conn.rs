@@ -52,6 +52,8 @@ const NAK_SLACK_US: i64 = 1_000;
 /// Tail probe: after SRTT + 4 RTTVar (at most SRTT / 2) + one ACK period
 /// + this.
 const PROBE_MARGIN_US: i64 = 1_000;
+/// Window of the ACK hold-off maximum (current and previous one count).
+const HOLDOFF_WINDOW_US: i64 = 1_000_000;
 /// ACK-head retransmission: the packet an ACK stops at is taken as lost
 /// if it was last sent more than SRTT + 2 RTTVar + this before the ACK.
 const ACK_HEAD_MARGIN_US: i64 = 1_000;
@@ -239,6 +241,17 @@ pub struct Connection {
     probe_dead: Option<u32>,
     /// A stall probe is queued for this sequence (speculative: no copy).
     stall_probe_seq: Option<u32>,
+    /// Highest sequence ever retransmitted for a hole (NAK, ACK-head, head
+    /// or stall probe; not a tail probe): ACK hold-off samples skip ACKs
+    /// whose range may hold one (a hole held them, not the ACK timer).
+    rexmit_hi: Option<u32>,
+    /// The tail probe queued for this sequence (its retransmission is no hole).
+    tail_probe_seq: Option<u32>,
+    /// ACK hold-off: max of (ACK arrival - last send of the newest packet
+    /// it covers - SRTT) over the current and the previous 1 s window.
+    holdoff_cur_us: i64,
+    holdoff_prev_us: i64,
+    holdoff_win_us: i64,
     /// The first holes given up (diagnosis).
     drop_log: Vec<crate::stats::DroppedHole>,
     /// The re-NAK interval last used to schedule holes.
@@ -357,6 +370,11 @@ impl Connection {
             probe_armed: false,
             probe_dead: None,
             stall_probe_seq: None,
+            rexmit_hi: None,
+            tail_probe_seq: None,
+            holdoff_cur_us: 0,
+            holdoff_prev_us: 0,
+            holdoff_win_us: 0,
             renak_sched_us: NEVER,
             drop_log: Vec::new(),
             nak_copy: Vec::new(),
@@ -577,6 +595,7 @@ impl Connection {
         let now_us = self.us(now);
         let snd_buf_ms = self.snd.oldest_origin_us().map_or(0, |o| ((now_us - o).max(0) / 1000) as u32);
         Snapshot {
+            ack_holdoff_us: self.holdoff_cur_us.max(self.holdoff_prev_us).min(u32::MAX as i64) as u32,
             rtt_us: self.srtt,
             rtt_var_us: self.rttvar,
             rtt_valid: self.rtt_valid,
@@ -1251,7 +1270,7 @@ impl Connection {
         if self.snd.rexmits(una) > 0 || self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) || self.probe_dead == Some(una) {
             return None; // repaired before: the head probe watches it
         }
-        Some(self.snd.last_tx_us(una) + self.ack_head_threshold_us(una) + SYN_US)
+        Some(self.snd.last_tx_us(una) + self.ack_head_threshold_us(una) + self.ack_wait_us())
     }
 
     fn on_ack(&mut self, now_us: i64, ackno: u32, a: &Ack) {
@@ -1261,6 +1280,7 @@ impl Connection {
             self.stats.ack_invalid += 1;
             return;
         }
+        self.holdoff_sample(now_us, a.seq);
         if a.kind == AckKind::Light {
             self.stats.pkt_recv_light_ack += 1;
             self.snd.ack(a.seq);
@@ -1286,6 +1306,51 @@ impl Connection {
             self.rtt_valid = true;
         }
         self.ack_head_check(now_us, a.seq);
+    }
+
+    /// One ACK hold-off sample from an ACK advancing to `ack`: the newest
+    /// packet it covers waited (now - its last send - SRTT) beyond a round
+    /// trip for its ACK. Skipped when a retransmitted packet may be in the
+    /// newly acknowledged range (the ACK was held by a hole, not by the
+    /// peer's ACK timer) or before an RTT sample.
+    fn holdoff_sample(&mut self, now_us: i64, ack: u32) {
+        if !self.rtt_valid || !seq_lt(self.snd.una, ack) {
+            return;
+        }
+        // the newest packet covered that was sent once (a tail probe's
+        // original may have arrived; the packet before it was sent with it)
+        let mut newest = seq_dec(ack);
+        if self.snd.holds_sent(newest) && self.snd.rexmits(newest) > 0 {
+            newest = seq_dec(newest);
+            if !seq_le(self.snd.una, newest) || self.snd.rexmits(newest) > 0 {
+                return;
+            }
+        }
+        match self.rexmit_hi {
+            Some(h) if seq_le(self.snd.una, h) => return,
+            Some(_) => self.rexmit_hi = None, // all behind: forget (no wrap ambiguity later)
+            None => {}
+        }
+        if !self.snd.holds_sent(newest) {
+            return;
+        }
+        let h = (now_us - self.snd.last_tx_us(newest) - self.srtt as i64).max(0);
+        if now_us - self.holdoff_win_us >= HOLDOFF_WINDOW_US {
+            self.holdoff_prev_us = self.holdoff_cur_us;
+            self.holdoff_cur_us = 0;
+            self.holdoff_win_us = now_us;
+        }
+        self.holdoff_cur_us = self.holdoff_cur_us.max(h);
+    }
+
+    /// How long a probe waits for the peer's ACK beyond the round trip:
+    /// one ACK period, or the measured hold-off (capped at latency / 2).
+    fn ack_wait_us(&self) -> i64 {
+        if !self.cfg.probe_ack_lag {
+            return SYN_US;
+        }
+        let cap = (self.snd_latency_ms as i64 * 1000 / 2).max(SYN_US);
+        self.holdoff_cur_us.max(self.holdoff_prev_us).min(cap).max(SYN_US)
     }
 
     fn on_ackack(&mut self, now_us: i64, ackno: u32, ts: u32) {
@@ -1368,6 +1433,7 @@ impl Connection {
                         self.probe_armed = false;
                         let s = seq_dec(self.snd.next_send);
                         self.snd_loss.insert(s, s);
+                        self.tail_probe_seq = Some(s);
                         self.stats.pkt_tail_probe += 1;
                     }
                 }
@@ -1438,7 +1504,7 @@ impl Connection {
     /// its variation (at most RTT/2), one ACK period and a margin.
     fn probe_delay_us(&self) -> i64 {
         let r = self.srtt as i64;
-        r + (4 * self.rttvar as i64).min(r / 2) + SYN_US + PROBE_MARGIN_US
+        r + (4 * self.rttvar as i64).min(r / 2) + self.ack_wait_us() + PROBE_MARGIN_US
     }
 
     /// RTT from ACK/ACKACK samples or the handshake estimate.
@@ -1759,6 +1825,11 @@ impl Connection {
         buf[..n].copy_from_slice(p);
         DataHeader::set_rexmit_in_place(buf);
         self.snd.mark_sent(seq, now_us);
+        if self.tail_probe_seq == Some(seq) {
+            self.tail_probe_seq = None;
+        } else if self.rexmit_hi.map_or(true, |h| seq_lt(h, seq)) {
+            self.rexmit_hi = Some(seq);
+        }
         // a repair in flight: wait for its ACK before probing
         self.last_data_tx_us = now_us;
         let wire = n - HDR_LEN + PKT_OVERHEAD;

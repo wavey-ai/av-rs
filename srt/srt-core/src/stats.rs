@@ -138,6 +138,8 @@ pub struct DroppedHole {
 /// A point-in-time view of the connection's state (libsrt "instant" fields).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    /// The peer's measured ACK hold-off (`Config::probe_ack_lag`), µs.
+    pub ack_holdoff_us: u32,
     pub rtt_us: u32,
     pub rtt_var_us: u32,
     /// The RTT is a real sample (not the 100 ms initial value).

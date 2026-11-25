@@ -27,6 +27,8 @@ struct Sim {
     delay: DelayFn,
     sent_a: Vec<Vec<u8>>,
     sent_b: Vec<Vec<u8>>,
+    /// Sim time, readable from drop/delay closures.
+    clock: std::rc::Rc<std::cell::Cell<Instant>>,
 }
 
 impl Sim {
@@ -49,6 +51,7 @@ impl Sim {
             delay: Box::new(|_, _| Duration::ZERO),
             sent_a: Vec::new(),
             sent_b: Vec::new(),
+            clock: std::rc::Rc::new(std::cell::Cell::new(t0)),
         }
     }
 
@@ -61,6 +64,7 @@ impl Sim {
     fn step(&mut self) {
         self.now += STEP;
         let now = self.now;
+        self.clock.set(now);
         let mut due = Vec::new();
         self.wire.retain(|(t, to, d)| {
             if *t <= now {
@@ -1431,4 +1435,60 @@ fn data_with_a_key_is_dropped_not_fatal() {
     assert_eq!(s.conn().stats().pkt_rcv_undecrypt, 1);
     let (_, missing) = run_frames(&mut s, 3, 10, Duration::from_millis(20), Duration::from_millis(300));
     assert_eq!(missing, 0);
+}
+
+/// A peer that ACKs late (libsrt's receive worker idles between frames:
+/// the ACK for a frame's tail can come ~20 ms after it): ACKs pass only
+/// ~20 ms after the newest data packet, so RTT samples stay true but the tail's ACK is late.
+/// With the measured hold-off (`probe_ack_lag`) the tail probe stops firing
+/// on every frame; a lost tail is still repaired well within the latency.
+fn slow_ack_run(probe_ack_lag: bool, lose_tail_of: Option<u32>) -> (srt_core::Stats, srt_core::Stats, usize, Vec<Duration>) {
+    let mut ccfg = cfg(120);
+    ccfg.probe_ack_lag = probe_ack_lag;
+    let mut s = Sim::new(ccfg, cfg(120), 1, 1000);
+    s.connect();
+    let clock = s.clock.clone();
+    let mut last_data: Option<Instant> = None;
+    let mut lost = false;
+    s.drop = Box::new(move |side, d| {
+        let now = clock.get();
+        if side == "a" && data_seq(d).is_some() {
+            last_data = Some(now);
+        }
+        if side == "b" && ctl_type(d) == Some(2) {
+            // an ACK made within 18 ms of the newest data packet is lost:
+            // the one that passes comes ~20 ms after a frame's tail
+            return last_data.map_or(false, |t| now < t + Duration::from_millis(18));
+        }
+        if let (Some(f), "a", Some(q)) = (lose_tail_of, side, data_seq(d)) {
+            if q == 1000 + 20 * (f + 1) - 1 && !lost {
+                lost = true;
+                return true;
+            }
+        }
+        false
+    });
+    let (lat, missing) = run_frames(&mut s, 96, 20, Duration::from_micros(41_667), Duration::from_millis(500));
+    (s.caller.stats().clone(), s.conn().stats().clone(), missing, lat)
+}
+
+#[test]
+fn probes_wait_for_a_slow_acking_peer() {
+    let (old, _, m0, _) = slow_ack_run(false, None);
+    let (new, rcv, m1, _) = slow_ack_run(true, None);
+    eprintln!("probes without {} with {} dup {}", old.pkt_tail_probe, new.pkt_tail_probe, rcv.pkt_rcv_duplicate);
+    assert_eq!((m0, m1), (0, 0));
+    // one ACK period of wait: most frames' tails are probed for nothing
+    assert!(old.pkt_tail_probe >= 20, "without the hold-off: {}", old.pkt_tail_probe);
+    // measured hold-off: a few probes while it is learnt
+    assert!(new.pkt_tail_probe * 5 <= old.pkt_tail_probe, "with: {} without: {}", new.pkt_tail_probe, old.pkt_tail_probe);
+    assert!(rcv.pkt_rcv_duplicate <= new.pkt_tail_probe + new.pkt_head_probe, "{rcv:?}");
+}
+
+#[test]
+fn lost_tail_is_still_repaired_with_a_slow_acking_peer() {
+    let (c, r, missing, lat) = slow_ack_run(true, Some(60));
+    assert_eq!(missing, 0, "{c:?}\n{r:?}");
+    assert_eq!(r.pkt_rcv_drop, 0);
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(121_500)), "{:?}", lat.iter().max());
 }

@@ -252,6 +252,22 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   delay) is skipped (`pktRexmitTooLate`); a probe of such a head is given
   up rather than retried.
 
+## Probes and a slow-ACKing peer (rs2)
+
+- Tail, head and stall probes wait, beyond the round trip, the peer's
+  measured ACK hold-off instead of one ACK period (`probe_ack_lag`,
+  default on). Sample: on an ACK advancing the window, the newest packet
+  it covers that was sent once (the one before a tail-probed packet)
+  waited `now - last send - SRTT` for it; skipped when a retransmission
+  for a hole (NAK, ACK-head, head or stall probe; tail probes do not
+  count) may lie in the acknowledged range, since a hole held that ACK.
+  The hold-off is the maximum over the current and the previous 1 s
+  window, capped at latency / 2, at least 10 ms. libsrt's receive worker
+  ACKs a frame's tail up to ~20 ms late when idle between frames, so one
+  ACK period (10 ms) made most tail probes toward libsrt duplicates.
+  Sim: a peer ACKing ~20 ms after the newest packet, RTT 2 ms, 96 frames:
+  96 tail probes before, 2 after; a lost tail is still repaired in time.
+
 ## srt-mio
 
 - `SrtSocket::connect(local, remote, cfg)`: non-blocking; the handshake
@@ -260,7 +276,13 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   `SrtSocket` is a `mio::event::Source` (its UDP socket).
 - `SrtListener::bind(addr, cfg)`: one UDP socket, demux by destination socket
   ID (0 -> the core `Listener`), connections in a map; `accept()` yields new
-  connection ids; `send/recv/stats/close` by id.
+  connection ids; `send/recv/stats/close` by id. Timers: each connection's
+  deadline is filed in a min-heap (lazy deletion); a connection touched by
+  a datagram, its timer or a call is marked dirty, and `drive_io` handles
+  only the dirty and due ones, then re-files their deadlines: a wake-up is
+  O(touched + due x log n), not a scan of every connection.
+- `SrtSocketSet`: many callers (a fan-out sender) with one timer heap, the
+  same dirty/due rule; the bench's sender uses it.
 - I/O: `recvmmsg` up to 64 datagrams per call, `sendmmsg` up to 64 per call,
   buffers preallocated; unsent datagrams stay queued on `EAGAIN`.
 - Timers: `poll_timeout()` from the core arms a `timerfd` (`SrtTimer`, a mio
@@ -292,4 +314,4 @@ UNSECURE (1011).
 2. (done) NAK (per-loss schedule), retransmission, sender drop, tail probe
    (spec 12).
 3. (done) FEC filter.
-4. GSO/GRO, O(1) listener timeouts, encryption.
+4. GSO/GRO, encryption. (Listener and fan-out timer heaps: done.)

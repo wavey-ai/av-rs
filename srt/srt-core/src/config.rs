@@ -71,6 +71,13 @@ pub struct Config {
     /// Costs a small NAK per NAK and a copy for about loss% of repairs.
     /// Not an SRT option; wire-compatible (duplicates are dropped).
     pub repair_copies: bool,
+    /// Tail, head and stall probes wait at least the peer's measured ACK
+    /// hold-off (how long after the newest packet arrives its ACK comes:
+    /// ours <= 10 ms, libsrt's up to ~20 ms when its receive worker idles
+    /// between frames), capped at latency / 2, instead of one ACK period.
+    /// Without it a probe toward a slow-ACKing peer is mostly a duplicate.
+    /// Not an SRT option.
+    pub probe_ack_lag: bool,
     /// ACKs report RTTVar >= SRTT / 4. A libsrt sender (RETRANSMITALGO=1)
     /// then serves every NAK instead of dropping requests that arrive
     /// within SRTT - 4 RTTVar of its last copy: our receiver paces its own
@@ -116,6 +123,7 @@ impl Default for Config {
             reorder_window_us: 2000,
             tail_probe: true,
             repair_copies: true,
+            probe_ack_lag: true,
             ack_rttvar_floor: true,
             pace_quantum_us: 250,
             fec_ack_head_delay_us: -1,
