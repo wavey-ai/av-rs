@@ -535,6 +535,12 @@ impl Connection {
         &self.cfg
     }
 
+    /// Smoothed RTT in µs and whether it is a real sample (cheap; for I/O
+    /// policies such as read coalescing).
+    pub fn rtt_us(&self) -> (u32, bool) {
+        (self.srtt, self.rtt_valid)
+    }
+
     pub fn stats(&self) -> &Stats {
         &self.stats
     }

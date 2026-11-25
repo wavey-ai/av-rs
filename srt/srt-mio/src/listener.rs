@@ -52,6 +52,10 @@ pub struct SrtListener {
     pub unknown_dst: u64,
     pub recv_calls: u64,
     pub recv_datagrams: u64,
+    /// Datagrams read by the last `drive_io` that read the socket.
+    pub last_read: usize,
+    /// Coalescing pauses taken (`coalesce_delay` returned Some).
+    pub coalesce_pauses: u64,
     may_read: bool,
 }
 
@@ -75,6 +79,8 @@ impl SrtListener {
             unknown_dst: 0,
             recv_calls: 0,
             recv_datagrams: 0,
+            last_read: 0,
+            coalesce_pauses: 0,
             may_read: true,
         })
     }
@@ -249,7 +255,32 @@ impl SrtListener {
                 break;
             }
         }
+        self.last_read = total;
         Ok(())
+    }
+
+    /// Read coalescing for a peer that paces packet by packet (libsrt
+    /// sends each packet on its own): after a small read (< `min_batch`
+    /// datagrams), wait `delay` before the next poll, so the next
+    /// `recvmmsg` takes a batch instead of one wake-up per 1-3 packets.
+    /// `delay` = min(SRTT / 16, `max`) of the first connection with an RTT
+    /// sample; None when that is zero, when a timer is due before it
+    /// ends, or when datagrams are queued to send. The pause delays only
+    /// reading (ACKs and NAKs by <= SRTT / 16); TSBPD delivery and timers
+    /// keep their times. Call after `drive_io`, before polling; sleep the
+    /// returned duration.
+    pub fn coalesce_delay(&mut self, now: Instant, min_batch: usize, max: std::time::Duration) -> Option<std::time::Duration> {
+        if self.last_read == 0 || self.last_read >= min_batch || self.tx.pending() > 0 {
+            return None;
+        }
+        let rtt = self.conns.values().map(|s| s.conn.rtt_us()).find(|r| r.1)?.0;
+        let d = std::time::Duration::from_micros(rtt as u64 / 16).min(max);
+        if d.is_zero() || self.poll_timeout().map_or(false, |t| t <= now + d) {
+            return None;
+        }
+        self.last_read = 0;
+        self.coalesce_pauses += 1;
+        Some(d)
     }
 
     /// Send what the dirty connections have due (a connection whose pacer

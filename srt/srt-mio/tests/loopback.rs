@@ -208,3 +208,56 @@ fn listener_timer_heap_many_callers() {
         assert_eq!((st.pkt_rcv_loss, st.pkt_rcv_drop), (0, 0));
     }
 }
+
+/// Read coalescing with a sender that sends one packet per wake-up: every
+/// message still arrives in order and on time, and the listener paused.
+#[test]
+fn read_coalescing_with_a_packet_paced_sender() {
+    let cfg = Config::default().with_latency_ms(60);
+    let opts = UdpOptions::default();
+    let mut l = SrtListener::bind("127.0.0.1:0".parse().unwrap(), cfg.clone(), &opts).unwrap();
+    let laddr = l.local_addr().unwrap();
+    let mut c = SrtSocket::connect("127.0.0.1:0".parse().unwrap(), laddr, cfg, &opts).unwrap();
+    let t0 = Instant::now();
+    let mut id = None;
+    let total = 3000u32;
+    let mut sent = 0u32;
+    let mut got = 0u32;
+    let mut late = 0u32;
+    let mut sent_at = Vec::new();
+    while got < total && t0.elapsed() < Duration::from_secs(10) {
+        let now = Instant::now();
+        c.drive(now).unwrap();
+        l.drive(now).unwrap();
+        if id.is_none() {
+            id = l.accept();
+        }
+        if c.is_connected() && sent < total {
+            let mut m = [0u8; 1316];
+            m[..4].copy_from_slice(&sent.to_be_bytes());
+            c.send(now, &m).unwrap();
+            c.flush(now).unwrap();
+            sent_at.push(now);
+            sent += 1;
+        }
+        if let Some(id) = id {
+            let now = Instant::now();
+            l.recv_with(id, now, |m| {
+                let k = u32::from_be_bytes(m.payload[..4].try_into().unwrap());
+                assert_eq!(k, got, "in order, no loss");
+                if now - sent_at[k as usize] > Duration::from_millis(70) {
+                    late += 1;
+                }
+                got += 1;
+            });
+        }
+        if let Some(d) = l.coalesce_delay(Instant::now(), 8, Duration::from_micros(300)) {
+            std::thread::sleep(d);
+        } else {
+            std::thread::sleep(Duration::from_micros(20));
+        }
+    }
+    assert_eq!(got, total);
+    assert!(late <= total / 100, "late {late}");
+    assert!(l.coalesce_pauses > 0);
+}
