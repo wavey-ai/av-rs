@@ -462,10 +462,11 @@ fn single_loss_is_nak_repaired_and_delivered_on_time() {
     }
     let r = s.conn().stats().clone();
     assert_eq!((r.pkt_rcv_loss, r.pkt_rcv_drop, r.pkt_rcv_retrans, r.pkt_rcv_repaired), (1, 0, 1, 1));
-    // one immediate NAK (an early attempt: no copy)
-    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (1, 1));
+    // one immediate NAK, sent twice back to back
+    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (2, 1));
     let c = s.caller.stats().clone();
-    assert_eq!((c.pkt_retrans, c.pkt_snd_loss, c.pkt_recv_nak), (1, 1, 1));
+    // both copies arrive; the second finds the request already queued
+    assert_eq!((c.pkt_retrans, c.pkt_snd_loss, c.pkt_recv_nak), (1, 2, 2));
     assert_eq!(c.pkt_sent, 6);
 }
 
@@ -701,7 +702,7 @@ fn reorder_beyond_tolerance_is_naked() {
     let (_, missing) = run_frames(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(300));
     assert_eq!(missing, 0);
     let r = s.conn().stats().clone();
-    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (1, 1));
+    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (2, 1));
     assert_eq!(s.caller.stats().pkt_retrans, 1);
 }
 
@@ -772,7 +773,7 @@ fn head_probe_repairs_when_the_receiver_does_not_renak() {
         }
         if side == "b" && ctl_type(d) == Some(packet::ctrl::NAK) {
             naks += 1;
-            return naks > 1;
+            return naks > 2;
         }
         false
     });
@@ -812,8 +813,10 @@ fn late_nak_copy_is_delayed_and_acks_floor_rttvar() {
         }
     }
     assert!(rttvar_ok > 0);
-    // first NAK alone; the re-NAK, then its copy >= 10 ms later
-    assert_eq!(naks.len(), 3, "{naks:?}");
-    assert_eq!(naks[1].1, naks[2].1);
-    assert!(naks[2].0 - naks[1].0 >= 10_000, "{naks:?}");
+    // first NAK and its copy at once; the re-NAK, then its copy >= 10 ms
+    // later
+    assert_eq!(naks.len(), 4, "{naks:?}");
+    assert_eq!(naks[0].0, naks[1].0);
+    assert_eq!(naks[2].1, naks[3].1);
+    assert!(naks[3].0 - naks[2].0 >= 10_000, "{naks:?}");
 }

@@ -57,13 +57,13 @@ pub struct Config {
     /// is queued, retransmit the newest one so a lost tail is seen at once.
     /// Not an SRT option.
     pub tail_probe: bool,
-    /// Late repair attempts go twice: a NAK for a hole NAKed before (or
-    /// with no time for another round) is sent again max(RTT/8, 10 ms)
-    /// later, and a packet is sent twice from its second retransmission on
-    /// (or when too little time is left for another round). A late attempt
-    /// then fails only if both copies are lost. Costs a copy for about
-    /// loss% of repairs. Not an SRT option; wire-compatible (duplicates are
-    /// dropped).
+    /// Every NAK is sent twice (at once for a first attempt; max(RTT/8,
+    /// 10 ms) later for a late one: a hole NAKed before, or with no time
+    /// for another round), and a packet is sent twice from its second
+    /// retransmission on (or when too little time is left for another
+    /// round). A late attempt then fails only if both copies are lost.
+    /// Costs a small NAK per NAK and a copy for about loss% of repairs.
+    /// Not an SRT option; wire-compatible (duplicates are dropped).
     pub repair_copies: bool,
     /// ACKs report RTTVar >= SRTT / 4. A libsrt sender (RETRANSMITALGO=1)
     /// then serves every NAK instead of dropping requests that arrive

@@ -1298,13 +1298,15 @@ impl Connection {
         }
         if self.rcv_loss.next_due() <= now_us {
             if let Some((n, late)) = self.encode_due_nak(now_us, ts, buf) {
-                if self.cfg.repair_copies && late {
-                    // a late attempt: send the NAK again a little later, so
-                    // a lost NAK does not cost the hole, and a sender that
-                    // serves every request (libsrt, given our RTTVar floor)
-                    // sends a second repair after its first
+                if self.cfg.repair_copies {
+                    // every NAK goes twice, so a lost NAK does not cost a
+                    // round: at once for a first attempt (the sender sees
+                    // both before it repairs: one repair); a little later
+                    // for a late attempt, so a sender that serves every
+                    // request (libsrt, given our RTTVar floor) sends a
+                    // second repair after its first
                     self.nak_copy.extend_from_slice(&buf[..n]);
-                    self.nak_copy_at_us = now_us + self.nak_copy_spacing_us();
+                    self.nak_copy_at_us = if late { now_us + self.nak_copy_spacing_us() } else { now_us };
                 }
                 return Some(n);
             }
@@ -1426,7 +1428,7 @@ impl Connection {
         // 20 ms after the origin)
         let reserve = if self.rtt_known() {
             let rt = (self.srtt as i64).max(if self.nak_rtt_valid { self.nak_srtt } else { 0 });
-            interval - NAK_MARGIN_US + (rt / 8).max(SPREAD_MARGIN_US) + self.nak_copy_spacing_us()
+            interval - NAK_MARGIN_US + (rt / 8).max(SPREAD_MARGIN_US)
         } else {
             0
         };

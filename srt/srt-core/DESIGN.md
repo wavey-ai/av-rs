@@ -106,9 +106,11 @@ Receiver (`RcvLossList`, a `VecDeque` of holes in sequence order):
   from ACKACKs, which are rare while a hole holds the ACK value, and it
   starts at RTT/2. A full ACK also goes out every 50 ms while holes hold
   the ACK value (libsrt sends none then), so RTT samples keep coming.
-- Late attempts go twice (`repair_copies`): a NAK for a hole NAKed before,
-  or with no time for another round, is sent again max(RTT/8, 10 ms)
-  later. With our sender the copy is suppressed unless the first was lost.
+- Every NAK goes twice (`repair_copies`): at once for a first attempt (the
+  sender sees both before repairing: one repair), and max(RTT/8, 10 ms)
+  later for a late attempt (a hole NAKed before, or with no time for
+  another round). Our sender suppresses the late copy unless the first
+  was lost.
 - ACKs report RTTVar >= SRTT/4 (`ack_rttvar_floor`; RTT unchanged): a
   libsrt sender (RETRANSMITALGO=1) then serves every request instead of
   dropping those within SRTT - 4 RTTVar of its last copy, so the delayed
