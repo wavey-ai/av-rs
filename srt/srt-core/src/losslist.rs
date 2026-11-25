@@ -72,7 +72,6 @@ impl RcvLossList {
         }
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.holes.is_empty()
     }
@@ -180,6 +179,11 @@ impl RcvLossList {
         Some(out)
     }
 
+    /// The runs that start before `seq` (for a drop log).
+    pub fn front_runs_before(&self, seq: u32) -> impl Iterator<Item = &Hole> {
+        self.holes.iter().take_while(move |h| seq_lt(h.first, seq))
+    }
+
     /// Forget every sequence before `seq` (delivered or dropped).
     /// Returns how many sequences were removed.
     pub fn remove_before(&mut self, seq: u32) -> u64 {
@@ -276,12 +280,15 @@ impl RcvLossList {
     /// (libsrt's RETRANSMITALGO=1, whose queueing behind new data adds to
     /// the RTT) does not swallow one.
     ///
-    /// Returns the number of sequences listed. Also recomputes `next_due`.
+    /// Returns the number of sequences listed and whether any run is a
+    /// late attempt (NAKed before, or with no time for another round after
+    /// this one). Also recomputes `next_due`.
     #[allow(clippy::too_many_arguments)]
-    pub fn collect_due(&mut self, now_us: i64, slack_us: i64, interval_us: i64, min_repair_us: i64, reserve_us: i64, max_words: usize, out: &mut Vec<(u32, u32)>) -> u64 {
+    pub fn collect_due(&mut self, now_us: i64, slack_us: i64, interval_us: i64, min_repair_us: i64, reserve_us: i64, max_words: usize, out: &mut Vec<(u32, u32)>) -> (u64, bool) {
         out.clear();
         let mut words = 0usize;
         let mut seqs = 0u64;
+        let mut late = false;
         let mut next = NEVER;
         let limit = now_us + slack_us;
         let n_ready = self.holes.len() - self.waiting;
@@ -300,21 +307,24 @@ impl RcvLossList {
                 words += w;
                 out.push((h.first, h.last));
                 seqs += h.len() as u64;
-                h.last_nak_us = now_us;
-                h.naks += 1;
                 let mut iv = interval_us;
                 if reserve_us > 0 && h.deadline_us != NEVER && interval_us > 0 {
                     let room = h.deadline_us - reserve_us - now_us;
                     if room >= interval_us {
                         iv = room / (room / interval_us);
+                    } else {
+                        late = true; // no room for another round
                     }
                 }
+                late |= h.naks > 0;
+                h.last_nak_us = now_us;
+                h.naks += 1;
                 h.next_nak_us = now_us + iv;
             }
             next = next.min(h.next_nak_us);
         }
         self.next_due = next;
-        seqs
+        (seqs, late)
     }
 
     #[cfg(test)]
@@ -511,23 +521,23 @@ mod tests {
         l.push(hole(30, 30, 5000), false);
         assert_eq!(l.next_due(), 1000);
         // at t=1000: two runs due (3 words), the third not yet
-        assert_eq!(l.collect_due(1000, 0, 40_000, 0, 0, 364, &mut out), 7);
+        assert_eq!(l.collect_due(1000, 0, 40_000, 0, 0, 364, &mut out).0, 7);
         assert_eq!(out, vec![(10, 10), (20, 25)]);
         assert_eq!(l.next_due(), 5000);
-        assert_eq!(l.collect_due(5000, 0, 40_000, 0, 0, 364, &mut out), 1);
+        assert_eq!(l.collect_due(5000, 0, 40_000, 0, 0, 364, &mut out).0, 1);
         assert_eq!(out, vec![(30, 30)]);
         assert_eq!(l.next_due(), 41_000);
         // word limit: only the single fits in 2 words after...
-        assert_eq!(l.collect_due(41_000, 0, 40_000, 0, 0, 2, &mut out), 1);
+        assert_eq!(l.collect_due(41_000, 0, 40_000, 0, 0, 2, &mut out).0, 1);
         assert_eq!(out, vec![(10, 10)]);
         assert_eq!(l.next_due(), 41_000, "the run that did not fit stays due");
-        assert_eq!(l.collect_due(41_000, 4000, 40_000, 0, 0, 364, &mut out), 7);
+        assert_eq!(l.collect_due(41_000, 4000, 40_000, 0, 0, 364, &mut out).0, 7);
         assert_eq!(out, vec![(20, 25), (30, 30)]);
         // a shorter interval brings the NAKed runs forward
         l.reschedule(20_000);
         assert_eq!(l.next_due(), 61_000);
         // deadline: no NAK when the repair cannot arrive in time
-        assert_eq!(l.collect_due(90_000, 0, 40_000, 30_000, 0, 364, &mut out), 0);
+        assert_eq!(l.collect_due(90_000, 0, 40_000, 30_000, 0, 364, &mut out).0, 0);
         assert!(out.is_empty());
         assert_eq!(l.next_due(), NEVER);
     }
@@ -542,15 +552,15 @@ mod tests {
         h.deadline_us = 1_000_000;
         l.push(h, false);
         let (iv, rep, res) = (256_000, 250_000, 255_000);
-        assert_eq!(l.collect_due(0, 0, iv, rep, res, 364, &mut out), 1);
+        assert_eq!(l.collect_due(0, 0, iv, rep, res, 364, &mut out).0, 1);
         // 745 ms of room: two more attempts, 372.5 ms apart (not 256)
         assert_eq!(l.next_due(), 372_500);
-        assert_eq!(l.collect_due(372_500, 0, iv, rep, res, 364, &mut out), 1);
+        assert_eq!(l.collect_due(372_500, 0, iv, rep, res, 364, &mut out).0, 1);
         assert_eq!(l.next_due(), 745_000);
-        assert_eq!(l.collect_due(745_000, 0, iv, rep, res, 364, &mut out), 1);
+        assert_eq!(l.collect_due(745_000, 0, iv, rep, res, 364, &mut out).0, 1);
         // no room for a fourth: it is scheduled at the plain interval and
         // then not sent (the repair could not arrive in time)
-        assert_eq!(l.collect_due(1_001_000, 0, iv, rep, res, 364, &mut out), 0);
+        assert_eq!(l.collect_due(1_001_000, 0, iv, rep, res, 364, &mut out).0, 0);
         assert_eq!(l.next_due(), NEVER);
     }
 
@@ -564,20 +574,20 @@ mod tests {
         let mut h = hole(20, 22, 50);
         h.detected_at_pkt = 102;
         l.push(h, true);
-        assert_eq!(l.collect_due(10, 0, 1000, 0, 0, 364, &mut out), 0);
+        assert_eq!(l.collect_due(10, 0, 1000, 0, 0, 364, &mut out).0, 0);
         // the second hole splits while waiting: both halves stay held
         l.fill(21);
         assert_eq!(l.snapshot(), vec![(10, 10), (20, 20), (22, 22)]);
         assert_eq!(l.release_waiting(100, 103, 3, 2000), 1);
         assert_eq!(l.oldest_waiting().unwrap().first, 20);
-        assert_eq!(l.collect_due(100, 0, 1000, 0, 0, 364, &mut out), 1);
+        assert_eq!(l.collect_due(100, 0, 1000, 0, 0, 364, &mut out).0, 1);
         assert_eq!(out, vec![(10, 10)]);
         // time cap releases the rest
         assert_eq!(l.release_waiting(2050, 103, 3, 2000), 2);
         assert!(l.oldest_waiting().is_none());
         l.fill(22);
         // (10, 10) is due again (NAKed at 100, interval 1000)
-        assert_eq!(l.collect_due(2050, 0, 1000, 0, 0, 364, &mut out), 2);
+        assert_eq!(l.collect_due(2050, 0, 1000, 0, 0, 364, &mut out).0, 2);
         assert_eq!(out, vec![(10, 10), (20, 20)]);
     }
 

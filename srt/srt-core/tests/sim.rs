@@ -462,18 +462,17 @@ fn single_loss_is_nak_repaired_and_delivered_on_time() {
     }
     let r = s.conn().stats().clone();
     assert_eq!((r.pkt_rcv_loss, r.pkt_rcv_drop, r.pkt_rcv_retrans, r.pkt_rcv_repaired), (1, 0, 1, 1));
-    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (2, 1), "one immediate NAK, sent twice");
+    // one immediate NAK (an early attempt: no copy)
+    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (1, 1));
     let c = s.caller.stats().clone();
-    // both copies arrive; the second finds the request already queued
-    assert_eq!((c.pkt_retrans, c.pkt_snd_loss, c.pkt_recv_nak), (1, 2, 2));
+    assert_eq!((c.pkt_retrans, c.pkt_snd_loss, c.pkt_recv_nak), (1, 1, 1));
     assert_eq!(c.pkt_sent, 6);
 }
 
 #[test]
 fn lost_retransmission_and_lost_nak_are_renaked() {
-    // 1002 and 1004 lost; the first NAK (both copies) lost; then the first
-    // retransmission of 1002 lost: three NAK rounds, the last repair of 1002
-    // sent twice (its second retransmission)
+    // 1002 and 1004 lost; the first NAK and the first re-NAK lost; the
+    // first retransmission of 1002 lost
     let mut s = Sim::new(cfg(200), cfg(200), 15, 1000);
     s.connect();
     s.run_until(Duration::from_millis(200), |_| false); // RTT known
@@ -500,10 +499,10 @@ fn lost_retransmission_and_lost_nak_are_renaked() {
     }
     let r = s.conn().stats().clone();
     assert_eq!(r.pkt_rcv_drop, 0);
-    // the lost NAK pair is NAKed again; the lost repair of 1002 is sent
-    // again by the receiver's re-NAK or the sender's head probe,
-    // whichever comes first (the other is suppressed or not needed)
-    assert!(r.pkt_sent_nak >= 4 && r.pkt_sent_nak % 2 == 0, "{r:?}");
+    // the lost NAKs are NAKed again (late attempts: each sent twice, the
+    // copy later); the lost repair of 1002 is sent again by the receiver's
+    // re-NAK or the sender's head probe, whichever comes first
+    assert!(r.pkt_sent_nak >= 3, "{r:?}");
     let c = s.caller.stats().clone();
     assert!(c.pkt_retrans >= 3 && c.pkt_retrans <= 1 + 3 + c.pkt_tail_probe + c.pkt_head_probe, "{c:?}");
     // one re-NAK interval is about one RTT (30 ms) + capped variation +
@@ -702,7 +701,7 @@ fn reorder_beyond_tolerance_is_naked() {
     let (_, missing) = run_frames(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(300));
     assert_eq!(missing, 0);
     let r = s.conn().stats().clone();
-    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (2, 1));
+    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (1, 1));
     assert_eq!(s.caller.stats().pkt_retrans, 1);
 }
 
@@ -773,7 +772,7 @@ fn head_probe_repairs_when_the_receiver_does_not_renak() {
         }
         if side == "b" && ctl_type(d) == Some(packet::ctrl::NAK) {
             naks += 1;
-            return naks > 2;
+            return naks > 1;
         }
         false
     });
@@ -782,4 +781,39 @@ fn head_probe_repairs_when_the_receiver_does_not_renak() {
     assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_200)), "{lat:?}");
     assert!(s.caller.stats().pkt_head_probe >= 1);
     assert_eq!(s.conn().stats().pkt_rcv_drop, 0);
+}
+
+#[test]
+fn late_nak_copy_is_delayed_and_acks_floor_rttvar() {
+    let mut s = Sim::new(cfg(200), cfg(200), 15, 2000);
+    s.connect();
+    s.run_until(Duration::from_millis(300), |_| false);
+    // 2002 lost twice: the re-NAK is a late attempt, sent again later
+    let mut n = 0;
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(2002) {
+            n += 1;
+            return n <= 2;
+        }
+        false
+    });
+    let (_, missing) = run_frames(&mut s, 1, 8, Duration::from_millis(40), Duration::from_millis(400));
+    assert_eq!(missing, 0);
+    let mut naks = Vec::new();
+    let mut rttvar_ok = 0;
+    for d in &s.sent_b {
+        match packet::decode(d).unwrap() {
+            Packet::Control { hdr, body: Control::Nak(l) } => naks.push((hdr.timestamp, l.raw().to_vec())),
+            Packet::Control { body: Control::Ack(a), .. } if a.kind != packet::AckKind::Light && a.rtt_us < 100_000 => {
+                assert!(a.rtt_var_us > a.rtt_us / 4, "{a:?}");
+                rttvar_ok += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(rttvar_ok > 0);
+    // first NAK alone; the re-NAK, then its copy >= 10 ms later
+    assert_eq!(naks.len(), 3, "{naks:?}");
+    assert_eq!(naks[1].1, naks[2].1);
+    assert!(naks[2].0 - naks[1].0 >= 10_000, "{naks:?}");
 }

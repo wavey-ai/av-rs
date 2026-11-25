@@ -57,12 +57,21 @@ pub struct Config {
     /// is queued, retransmit the newest one so a lost tail is seen at once.
     /// Not an SRT option.
     pub tail_probe: bool,
-    /// Send every NAK twice, and a packet twice from its second
-    /// retransmission on: a repair attempt then fails only if both copies
-    /// are lost, so fewer RTTs of latency carry the same loss. Costs one
-    /// small control packet per NAK and a copy for ~loss% of repairs. Not
-    /// an SRT option; wire-compatible (libsrt drops duplicates).
+    /// Late repair attempts go twice: a NAK for a hole NAKed before (or
+    /// with no time for another round) is sent again max(RTT/8, 10 ms)
+    /// later, and a packet is sent twice from its second retransmission on
+    /// (or when too little time is left for another round). A late attempt
+    /// then fails only if both copies are lost. Costs a copy for about
+    /// loss% of repairs. Not an SRT option; wire-compatible (duplicates are
+    /// dropped).
     pub repair_copies: bool,
+    /// ACKs report RTTVar >= SRTT / 4. A libsrt sender (RETRANSMITALGO=1)
+    /// then serves every NAK instead of dropping requests that arrive
+    /// within SRTT - 4 RTTVar of its last copy: our receiver paces its own
+    /// NAKs per hole, and its delayed NAK copy on a late attempt then
+    /// yields a second repair. The RTT itself is reported unchanged. Not an
+    /// SRT option.
+    pub ack_rttvar_floor: bool,
     /// When the pacer holds packets back, wake this long after the next
     /// packet is allowed, so each wake-up sends a batch (the pacer's 1 ms
     /// burst allowance keeps the rate). Not an SRT option.
@@ -95,6 +104,7 @@ impl Default for Config {
             reorder_window_us: 2000,
             tail_probe: true,
             repair_copies: true,
+            ack_rttvar_floor: true,
             pace_quantum_us: 250,
         }
     }

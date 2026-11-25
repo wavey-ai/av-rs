@@ -101,8 +101,22 @@ Receiver (`RcvLossList`, a `VecDeque` of holes in sequence order):
   forward when the RTT estimate falls (first sample). libsrt instead
   re-sends its whole loss list every max(RTT/2 + 2 RTTVar, 20 ms), 300 ms
   before its first RTT sample.
-- Every NAK is sent twice (`repair_copies`): a lost NAK no longer costs a
-  round.
+- The re-NAK interval uses the measured repair time and its own variation
+  once there are samples (one per repaired loss), not RTTVar: RTTVar comes
+  from ACKACKs, which are rare while a hole holds the ACK value, and it
+  starts at RTT/2. A full ACK also goes out every 50 ms while holes hold
+  the ACK value (libsrt sends none then), so RTT samples keep coming.
+- Late attempts go twice (`repair_copies`): a NAK for a hole NAKed before,
+  or with no time for another round, is sent again max(RTT/8, 10 ms)
+  later. With our sender the copy is suppressed unless the first was lost.
+- ACKs report RTTVar >= SRTT/4 (`ack_rttvar_floor`; RTT unchanged): a
+  libsrt sender (RETRANSMITALGO=1) then serves every request instead of
+  dropping those within SRTT - 4 RTTVar of its last copy, so the delayed
+  NAK copy of a late attempt yields a second repair. Our receiver paces
+  its own NAKs, so this costs only those copies. Measured: libsrt sender
+  to our receiver at RTT 250, 5 % loss, latency 1 s lost 1-8 frames per
+  run before this, as many attempts as libsrt's own receiver but without
+  its extra (duplicate) repairs.
 
 Sender (`SndLossList`, merged runs in order):
 

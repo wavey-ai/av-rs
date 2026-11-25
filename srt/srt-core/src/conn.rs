@@ -34,6 +34,10 @@ const HS_MAX_US: i64 = 1_000_000;
 const HS_RSP_RESENDS: u32 = 5;
 const MAX_ACKACK_QUEUE: usize = 64;
 const MAX_DROPREQ_QUEUE: usize = 64;
+const DROP_LOG_MAX: usize = 32;
+/// Send a full ACK at least this often while holes keep its value
+/// unchanged (libsrt then sends none): the ACKACK keeps RTT samples coming.
+const ACK_RTT_PROBE_US: i64 = 50_000;
 /// Re-NAK a hole this long after its last NAK, beyond the measured repair
 /// time + 4 x its variation (spec 12 #4).
 const NAK_MARGIN_US: i64 = 2_000;
@@ -213,6 +217,7 @@ pub struct Connection {
     nak_srtt: i64,
     nak_rttvar: i64,
     nak_rtt_valid: bool,
+    nak_rtt_max: i64,
 
     // sender loss recovery
     snd_loss: SndLossList,
@@ -220,10 +225,14 @@ pub struct Connection {
     /// Last data transmission (new or retransmitted): the tail probe base.
     last_data_tx_us: i64,
     probe_armed: bool,
+    /// The first holes given up (diagnosis).
+    drop_log: Vec<crate::stats::DroppedHole>,
     /// The re-NAK interval last used to schedule holes.
     renak_sched_us: i64,
     /// A copy of the last NAK, sent right after it (`repair_copies`).
     nak_copy: Vec<u8>,
+    /// When the NAK copy goes out.
+    nak_copy_at_us: i64,
     /// A sequence to send once more right after its retransmission.
     rexmit_copy: Option<u32>,
 
@@ -312,12 +321,15 @@ impl Connection {
             nak_srtt: 0,
             nak_rttvar: 0,
             nak_rtt_valid: false,
+            nak_rtt_max: 0,
             snd_loss: SndLossList::new(),
             dropreqs: VecDeque::with_capacity(MAX_DROPREQ_QUEUE),
             last_data_tx_us: 0,
             probe_armed: false,
             renak_sched_us: NEVER,
+            drop_log: Vec::new(),
             nak_copy: Vec::new(),
+            nak_copy_at_us: NEVER,
             rexmit_copy: None,
             srtt: INIT_RTT_US,
             rttvar: INIT_RTTVAR_US,
@@ -509,6 +521,8 @@ impl Connection {
             pacing_bytes_per_s: self.pacer.rate(),
             drift_us: self.tsbpd.as_ref().map_or(0, |t| t.drift_us()),
             nak_rtt_us: if self.nak_rtt_valid { self.nak_srtt as u32 } else { 0 },
+            nak_rtt_var_us: self.nak_rttvar as u32,
+            nak_rtt_max_us: self.nak_rtt_max as u32,
             renak_interval_us: self.renak_interval_us() as u32,
             rcv_loss_runs: self.rcv_loss.runs() as u32,
             rcv_loss_seqs: self.rcv_loss.seqs(),
@@ -845,12 +859,13 @@ impl Connection {
         if r <= 0 {
             return;
         }
+        self.nak_rtt_max = self.nak_rtt_max.max(r);
         if self.nak_rtt_valid {
             self.nak_rttvar = (3 * self.nak_rttvar + (r - self.nak_srtt).abs()) / 4;
             self.nak_srtt = (7 * self.nak_srtt + r) / 8;
         } else {
             self.nak_srtt = r;
-            self.nak_rttvar = r / 2;
+            self.nak_rttvar = r / 8;
             self.nak_rtt_valid = true;
         }
         self.maybe_reschedule_naks();
@@ -872,12 +887,15 @@ impl Connection {
     fn renak_interval_us(&self) -> i64 {
         let (mut rt, mut rv) = (self.srtt as i64, self.rttvar as i64);
         if self.nak_rtt_valid {
+            // the measured repair time and its own variation: many samples
+            // (one per repaired loss), while RTTVar (from ACKACKs, rare
+            // while a hole holds the ACK) starts at RTT/2 and settles slowly
             rt = rt.max(self.nak_srtt);
-            rv = rv.max(self.nak_rttvar);
+            rv = self.nak_rttvar;
         }
-        // the variation term is capped at RTT/2: RTTVar starts at RTT/2 and
-        // takes ~10 samples to settle, and a premature re-NAK only costs a
-        // request the sender suppresses (it arrives before the repair could)
+        // the variation term is capped at RTT/2: a premature re-NAK only
+        // costs a request the sender suppresses (it arrives before the
+        // repair could)
         (rt + (4 * rv).min(rt / 2) + NAK_MARGIN_US).max(NAK_MIN_INTERVAL_US)
     }
 
@@ -1078,7 +1096,9 @@ impl Connection {
         let ack = self.rcv.ack;
         let rto = self.srtt as i64 + 4 * self.rttvar as i64;
         let unconfirmed = seq_lt(self.last_ackack_seq, ack);
-        if ack != self.last_ack_seq || (unconfirmed && now_us - self.last_ack_us > rto) {
+        // also while holes hold the ACK value, so RTT samples keep coming
+        let rtt_probe = !self.rcv_loss.is_empty() && now_us - self.last_ack_us >= ACK_RTT_PROBE_US;
+        if ack != self.last_ack_seq || (unconfirmed && now_us - self.last_ack_us > rto) || rtt_probe {
             self.ack_due = Some(if now_us - self.last_full_ack_us >= SYN_US {
                 AckKind::Full
             } else {
@@ -1194,6 +1214,9 @@ impl Connection {
                     t = t.min(self.pacer.next_ns() / 1000);
                 }
                 t = t.min(self.rcv_loss.next_due());
+                if !self.nak_copy.is_empty() {
+                    t = t.min(self.nak_copy_at_us);
+                }
                 if let Some(h) = self.rcv_loss.oldest_waiting() {
                     t = t.min(h.detected_us + self.cfg.reorder_window_us as i64);
                 }
@@ -1264,17 +1287,24 @@ impl Connection {
         if let Some(kind) = self.ack_due.take() {
             return Some(self.encode_ack(kind, now_us, ts, buf));
         }
-        if !self.nak_copy.is_empty() {
+        if !self.nak_copy.is_empty() && (now_us >= self.nak_copy_at_us || self.rcv_loss.next_due() <= now_us) {
             let n = self.nak_copy.len();
             buf[..n].copy_from_slice(&self.nak_copy);
+            buf[8..12].copy_from_slice(&ts.to_be_bytes()); // control timestamp = now
             self.nak_copy.clear();
+            self.nak_copy_at_us = NEVER;
             self.stats.pkt_sent_nak += 1;
             return Some(n);
         }
         if self.rcv_loss.next_due() <= now_us {
-            if let Some(n) = self.encode_due_nak(now_us, ts, buf) {
-                if self.cfg.repair_copies {
+            if let Some((n, late)) = self.encode_due_nak(now_us, ts, buf) {
+                if self.cfg.repair_copies && late {
+                    // a late attempt: send the NAK again a little later, so
+                    // a lost NAK does not cost the hole, and a sender that
+                    // serves every request (libsrt, given our RTTVar floor)
+                    // sends a second repair after its first
                     self.nak_copy.extend_from_slice(&buf[..n]);
+                    self.nak_copy_at_us = now_us + self.nak_copy_spacing_us();
                 }
                 return Some(n);
             }
@@ -1378,7 +1408,13 @@ impl Connection {
 
     /// A NAK listing every hole whose (re-)NAK is due, compressed into
     /// ranges, at most maxPayload / 4 words (the rest follow in the next).
-    fn encode_due_nak(&mut self, now_us: i64, ts: u32, buf: &mut [u8]) -> Option<usize> {
+    /// Delay of a NAK copy: max(RTT / 8, 10 ms), enough for the sender to
+    /// have sent the first repair (libsrt queues it behind a frame burst).
+    fn nak_copy_spacing_us(&self) -> i64 {
+        (self.srtt as i64 / 8).max(SPREAD_MARGIN_US)
+    }
+
+    fn encode_due_nak(&mut self, now_us: i64, ts: u32, buf: &mut [u8]) -> Option<(usize, bool)> {
         let interval = self.renak_interval_us();
         let min_repair = if self.rtt_known() { self.srtt as i64 } else { 0 };
         let max_words = (self.max_payload / 4).max(2);
@@ -1390,18 +1426,18 @@ impl Connection {
         // 20 ms after the origin)
         let reserve = if self.rtt_known() {
             let rt = (self.srtt as i64).max(if self.nak_rtt_valid { self.nak_srtt } else { 0 });
-            interval - NAK_MARGIN_US + (rt / 8).max(SPREAD_MARGIN_US)
+            interval - NAK_MARGIN_US + (rt / 8).max(SPREAD_MARGIN_US) + self.nak_copy_spacing_us()
         } else {
             0
         };
-        let seqs = self.rcv_loss.collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, &mut out);
+        let (seqs, late) = self.rcv_loss.collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, &mut out);
         self.renak_sched_us = interval;
         let r = if out.is_empty() {
             None
         } else {
             self.stats.pkt_sent_nak += 1;
             self.stats.nak_seqs_sent += seqs;
-            Some(packet::encode_nak(out.iter().copied(), ts, self.peer_sid, max_words, buf))
+            Some((packet::encode_nak(out.iter().copied(), ts, self.peer_sid, max_words, buf), late))
         };
         self.nak_scratch = out;
         r
@@ -1420,7 +1456,7 @@ impl Connection {
             kind,
             seq,
             rtt_us: self.srtt,
-            rtt_var_us: self.rttvar,
+            rtt_var_us: if self.cfg.ack_rttvar_floor { self.rttvar.max(self.srtt / 4 + 1) } else { self.rttvar },
             avail_buf: self.rcv.available(),
             pkt_rate: 0,
             bandwidth: 0,
@@ -1520,10 +1556,31 @@ impl Connection {
                 return None;
             }
             let n = self.rcv.drop_until(f.seq);
+            if self.drop_log.len() < DROP_LOG_MAX {
+                for h in self.rcv_loss.front_runs_before(self.rcv.base) {
+                    if self.drop_log.len() < DROP_LOG_MAX {
+                        self.drop_log.push(crate::stats::DroppedHole {
+                            first: h.first,
+                            last: h.last,
+                            naks: h.naks,
+                            detected_us: h.detected_us,
+                            last_nak_us: h.last_nak_us,
+                            deadline_us: h.deadline_us,
+                            dropped_us: now_us,
+                        });
+                    }
+                }
+            }
             self.rcv_loss.remove_before(self.rcv.base);
             self.stats.pkt_rcv_drop += n as u64;
             self.stats.byte_rcv_drop += n as u64 * (self.cfg.payload_size + PKT_OVERHEAD) as u64;
         }
+    }
+
+    /// The first holes the receiver gave up (at most 32), with their NAK
+    /// history: for diagnosis.
+    pub fn dropped_holes(&self) -> &[crate::stats::DroppedHole] {
+        &self.drop_log
     }
 
     /// Our receive latency and the peer's (for our data), ms.

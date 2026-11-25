@@ -102,6 +102,19 @@ pub struct Stats {
     pub datagrams_recv: u64,
 }
 
+/// A hole the receiver gave up (TSBPD drop), for diagnosis: times are us
+/// on the connection clock.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DroppedHole {
+    pub first: u32,
+    pub last: u32,
+    pub naks: u32,
+    pub detected_us: i64,
+    pub last_nak_us: i64,
+    pub deadline_us: i64,
+    pub dropped_us: i64,
+}
+
 /// A point-in-time view of the connection's state (libsrt "instant" fields).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
@@ -134,6 +147,9 @@ pub struct Snapshot {
     /// Receiver: smoothed time from a NAK to the repair arriving, us (0
     /// until measured), and the re-NAK interval in use.
     pub nak_rtt_us: u32,
+    pub nak_rtt_var_us: u32,
+    /// Largest NAK -> repair sample.
+    pub nak_rtt_max_us: u32,
     pub renak_interval_us: u32,
     /// Receiver loss list: runs and sequences; sender loss list runs.
     pub rcv_loss_runs: u32,

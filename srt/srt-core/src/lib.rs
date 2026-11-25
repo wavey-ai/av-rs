@@ -27,4 +27,4 @@ pub use config::Config;
 pub use conn::{CloseReason, Connection, Delivered, Event, Role, SendError, State, Transmit};
 pub use handshake::RejectReason;
 pub use listener::{random_isn, random_socket_id, AcceptCallback, AcceptRequest, Listener, ListenerAction, ListenerStats};
-pub use stats::{Snapshot, Stats};
+pub use stats::{DroppedHole, Snapshot, Stats};
