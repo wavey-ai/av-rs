@@ -1151,7 +1151,14 @@ impl Connection {
             return;
         }
         let age = now_us - self.snd.last_tx_us(x);
-        if age > self.srtt as i64 + 2 * self.rttvar as i64 + ACK_HEAD_MARGIN_US {
+        let mut thr = self.srtt as i64 + 2 * self.rttvar as i64 + ACK_HEAD_MARGIN_US;
+        if self.fec_tx.is_some() && self.snd.rexmits(x) == 0 {
+            // with FEC a receiver holds its ACK on a hole its filter will
+            // still rebuild (libsrt: up to two matrices): only a long stall
+            // means a lost packet whose one-shot onreq NAK was lost too
+            thr += (self.snd_latency_ms as i64 * 1000 / 4).max(SYN_US);
+        }
+        if age > thr {
             self.snd_loss.insert(x, x);
             self.stats.pkt_ack_rexmit += 1;
         }
