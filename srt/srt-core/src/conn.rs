@@ -237,6 +237,8 @@ pub struct Connection {
     /// The head sequence whose probes were given up (a copy would arrive
     /// after its play time).
     probe_dead: Option<u32>,
+    /// A stall probe is queued for this sequence (speculative: no copy).
+    stall_probe_seq: Option<u32>,
     /// The first holes given up (diagnosis).
     drop_log: Vec<crate::stats::DroppedHole>,
     /// The re-NAK interval last used to schedule holes.
@@ -354,6 +356,7 @@ impl Connection {
             last_data_tx_us: 0,
             probe_armed: false,
             probe_dead: None,
+            stall_probe_seq: None,
             renak_sched_us: NEVER,
             drop_log: Vec::new(),
             nak_copy: Vec::new(),
@@ -1386,6 +1389,7 @@ impl Connection {
                             self.probe_dead = Some(s);
                         } else {
                             self.snd_loss.insert(s, s);
+                            self.stall_probe_seq = Some(s);
                             self.stats.pkt_stall_probe += 1;
                         }
                     }
@@ -1672,7 +1676,13 @@ impl Connection {
                 }
                 self.snd_loss.pop();
                 let n = self.snd.count_rexmit(seq);
-                if self.cfg.repair_copies && (n >= 2 || self.last_chance(seq, now_us)) {
+                // a stall probe is a guess (the receiver may still rebuild
+                // the packet): one copy only
+                let speculative = self.stall_probe_seq == Some(seq);
+                if speculative {
+                    self.stall_probe_seq = None;
+                }
+                if self.cfg.repair_copies && !speculative && (n >= 2 || self.last_chance(seq, now_us)) {
                     // an earlier repair was lost, or there is no time for
                     // another round: send this one twice
                     self.rexmit_copy = Some(seq);
