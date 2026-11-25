@@ -52,6 +52,10 @@ const NAK_SLACK_US: i64 = 1_000;
 /// Tail probe: after SRTT + 4 RTTVar (at most SRTT / 2) + one ACK period
 /// + this.
 const PROBE_MARGIN_US: i64 = 1_000;
+/// Automatic reorder wait: margin over the observed lateness, and the
+/// smallest cap (min(latency / 8, max(SRTT / 2, this))).
+const REORDER_MARGIN_US: i64 = 500;
+const REORDER_MIN_CAP_US: i64 = 2_000;
 /// Window of the ACK hold-off maximum (current and previous one count).
 const HOLDOFF_WINDOW_US: i64 = 1_000_000;
 /// ACK-head retransmission: the packet an ACK stops at is taken as lost
@@ -252,6 +256,10 @@ pub struct Connection {
     holdoff_cur_us: i64,
     holdoff_prev_us: i64,
     holdoff_win_us: i64,
+    /// Observed reorder lateness (auto_reorder), two 1 s windows.
+    reorder_cur_us: i64,
+    reorder_prev_us: i64,
+    reorder_win_us: i64,
     /// The first holes given up (diagnosis).
     drop_log: Vec<crate::stats::DroppedHole>,
     /// The re-NAK interval last used to schedule holes.
@@ -375,6 +383,9 @@ impl Connection {
             holdoff_cur_us: 0,
             holdoff_prev_us: 0,
             holdoff_win_us: 0,
+            reorder_cur_us: 0,
+            reorder_prev_us: 0,
+            reorder_win_us: 0,
             renak_sched_us: NEVER,
             drop_log: Vec::new(),
             nak_copy: Vec::new(),
@@ -602,6 +613,7 @@ impl Connection {
         let snd_buf_ms = self.snd.oldest_origin_us().map_or(0, |o| ((now_us - o).max(0) / 1000) as u32);
         Snapshot {
             ack_holdoff_us: self.holdoff_cur_us.max(self.holdoff_prev_us).min(u32::MAX as i64) as u32,
+            reorder_wait_us: self.reorder_wait_us().clamp(0, u32::MAX as i64) as u32,
             rtt_us: self.srtt,
             rtt_var_us: self.rttvar,
             rtt_valid: self.rtt_valid,
@@ -991,12 +1003,12 @@ impl Connection {
                 if rexmit && f.naks == 1 {
                     self.nak_rtt_sample(now_us - f.last_nak_us);
                 }
+                if !rexmit && !rebuilt {
+                    self.reorder_sample(now_us, now_us - f.detected_us);
+                }
             }
         }
-        if self.cfg.loss_max_ttl > 0 && self.rcv_loss.oldest_waiting().is_some() {
-            let w = self.cfg.reorder_window_us as i64;
-            self.rcv_loss.release_waiting(now_us, self.rcv_pkt_count, self.cfg.loss_max_ttl, w);
-        }
+        self.release_reordered(now_us);
     }
 
     /// A FEC packet (spec 8.5, 8.6).
@@ -1085,6 +1097,53 @@ impl Connection {
         }
     }
 
+    /// How long a new hole waits for a reordered packet before its first
+    /// NAK: LOSSMAXTTL's time bound when set, else the automatic reorder
+    /// wait (0 until the path is seen to reorder).
+    fn reorder_wait_us(&self) -> i64 {
+        if self.cfg.loss_max_ttl > 0 {
+            return self.cfg.reorder_window_us as i64;
+        }
+        if !self.cfg.auto_reorder {
+            return 0;
+        }
+        let w = self.reorder_cur_us.max(self.reorder_prev_us);
+        if w == 0 {
+            return 0;
+        }
+        let lat = self.rcv_latency_ms as i64 * 1000;
+        let cap = (lat / 8).min((self.srtt as i64 / 2).max(REORDER_MIN_CAP_US));
+        w.min(cap)
+    }
+
+    /// An original packet filled a hole `late` µs after it was found
+    /// missing: the path reorders by about that much.
+    fn reorder_sample(&mut self, now_us: i64, late: i64) {
+        self.stats.pkt_rcv_reordered += 1;
+        self.roll_reorder_window(now_us);
+        self.reorder_cur_us = self.reorder_cur_us.max(late + REORDER_MARGIN_US);
+    }
+
+    fn roll_reorder_window(&mut self, now_us: i64) {
+        if now_us - self.reorder_win_us >= HOLDOFF_WINDOW_US {
+            // a whole window without reordering ends the previous one too
+            self.reorder_prev_us = if now_us - self.reorder_win_us >= 2 * HOLDOFF_WINDOW_US { 0 } else { self.reorder_cur_us };
+            self.reorder_cur_us = 0;
+            self.reorder_win_us = now_us;
+        }
+    }
+
+    /// Release waiting holes whose reorder wait (or LOSSMAXTTL) is over.
+    fn release_reordered(&mut self, now_us: i64) {
+        if self.rcv_loss.oldest_waiting().is_none() {
+            return;
+        }
+        self.roll_reorder_window(now_us);
+        let ttl = if self.cfg.loss_max_ttl > 0 { self.cfg.loss_max_ttl } else { u32::MAX };
+        let w = self.reorder_wait_us();
+        self.rcv_loss.release_waiting(now_us, self.rcv_pkt_count, ttl, w);
+    }
+
     /// A new gap `a..=b`, revealed by a packet with timestamp `ts`: NAK it
     /// at once, or after the reorder tolerance (spec 6.3).
     fn on_loss(&mut self, now_us: i64, a: u32, b: u32, ts: u32) {
@@ -1099,7 +1158,7 @@ impl Connection {
             Some(ArqLevel::Never) => NEVER,
             Some(_) => now_us + self.fec_nak_cap_us(),
         };
-        let wait = self.arq.is_none() && self.cfg.loss_max_ttl > 0 && self.peer_flags & flags::REXMITFLG != 0;
+        let wait = self.arq.is_none() && self.peer_flags & flags::REXMITFLG != 0 && self.reorder_wait_us() > 0;
         self.rcv_loss.push(
             Hole {
                 first: a,
@@ -1428,10 +1487,7 @@ impl Connection {
                 if now_us - self.last_send_us >= KEEPALIVE_US {
                     self.keepalive_due = true;
                 }
-                if self.cfg.loss_max_ttl > 0 && self.rcv_loss.oldest_waiting().is_some() {
-                    let w = self.cfg.reorder_window_us as i64;
-                    self.rcv_loss.release_waiting(now_us, self.rcv_pkt_count, self.cfg.loss_max_ttl, w);
-                }
+                self.release_reordered(now_us);
                 if let Some(t) = self.probe_at_us() {
                     if now_us >= t {
                         // the newest packet: if it was lost the receiver
@@ -1609,7 +1665,7 @@ impl Connection {
                     t = t.min(self.nak_copy_at_us);
                 }
                 if let Some(h) = self.rcv_loss.oldest_waiting() {
-                    t = t.min(h.detected_us + self.cfg.reorder_window_us as i64);
+                    t = t.min(h.detected_us + self.reorder_wait_us());
                 }
                 if let Some(p) = self.probe_at_us() {
                     t = t.min(p);

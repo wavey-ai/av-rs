@@ -48,6 +48,8 @@ pub(crate) struct Filled {
     /// The run's NAK count and last NAK time before the fill.
     pub naks: u32,
     pub last_nak_us: i64,
+    /// When the run was found missing.
+    pub detected_us: i64,
 }
 
 #[derive(Default)]
@@ -155,6 +157,7 @@ impl RcvLossList {
         let out = Filled {
             naks: h.naks,
             last_nak_us: h.last_nak_us,
+            detected_us: h.detected_us,
         };
         self.seqs -= 1;
         if h.first == h.last {

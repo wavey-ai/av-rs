@@ -58,6 +58,14 @@ pub struct Config {
     /// With `loss_max_ttl` > 0, NAK a gap after at most this long even if
     /// fewer packets arrived (spec 12 #14). Not an SRT option.
     pub reorder_window_us: u32,
+    /// With `loss_max_ttl` 0 (libsrt's default, the bench's setting): when
+    /// an original (not retransmitted) packet fills a hole, the path
+    /// reorders; new holes then wait the observed reorder lateness (max over
+    /// the current and previous 1 s, capped at min(latency / 8,
+    /// max(SRTT / 2, 2 ms))) before their first NAK, instead of a NAK and a
+    /// needless retransmission per reordered packet. Back to 0 two seconds
+    /// after the last reordering. Not an SRT option (receiver-side timing).
+    pub auto_reorder: bool,
     /// Sender tail probe (spec 12 #5): when the newest packets stay
     /// unacknowledged for SRTT + 4 RTTVar + one ACK period and nothing newer
     /// is queued, retransmit the newest one so a lost tail is seen at once.
@@ -121,6 +129,7 @@ impl Default for Config {
             drift_tracer: true,
             loss_max_ttl: 0,
             reorder_window_us: 2000,
+            auto_reorder: true,
             tail_probe: true,
             repair_copies: true,
             probe_ack_lag: true,

@@ -74,6 +74,8 @@ pub struct Stats {
     pub byte_rcv_drop: u64,
     /// Packets arriving after their slot was delivered or dropped (pktRcvBelated).
     pub pkt_rcv_belated: u64,
+    /// Originals (not retransmissions) that filled a hole: reordered on the path.
+    pub pkt_rcv_reordered: u64,
     pub pkt_rcv_duplicate: u64,
     pub pkt_rcv_too_far: u64,
     /// Receive-window restarts: a packet beyond the buffer arrived with the
@@ -138,6 +140,8 @@ pub struct DroppedHole {
 /// A point-in-time view of the connection's state (libsrt "instant" fields).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    /// Current automatic reorder wait (`Config::auto_reorder`), µs.
+    pub reorder_wait_us: u32,
     /// The peer's measured ACK hold-off (`Config::probe_ack_lag`), µs.
     pub ack_holdoff_us: u32,
     pub rtt_us: u32,

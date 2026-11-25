@@ -1562,3 +1562,33 @@ fn weak_set_c_small_buffers() {
             r.pkt_rcv_loss, r.pkt_rcv_drop, c.pkt_retrans, c.pkt_rexmit_copies, c.pkt_rexmit_too_late, c.pkt_tail_probe, c.pkt_head_probe, c.pkt_ack_rexmit, c.pkt_rexmit_suppressed);
     }
 }
+
+fn jitter_run(auto: bool, pct: f64, seed: u64) -> (usize, srt_core::Stats, srt_core::Stats) {
+    let mut lcfg = cfg(120);
+    lcfg.auto_reorder = auto;
+    let mut s = Sim::new(cfg(120), lcfg, 15, 21);
+    s.connect();
+    let mut rng = Rng(seed);
+    let mut rng2 = Rng(seed ^ 0xABCD);
+    s.drop = Box::new(move |_, _| rng.chance(pct));
+    // data from the caller: 0-10 ms extra delay, uniform (netem jitter reorders)
+    s.delay = Box::new(move |side, d| if side == "a" && data_seq(d).is_some() { Duration::from_micros(rng2.next() % 10_000) } else { Duration::ZERO });
+    let (_, missing) = run_frames(&mut s, 96, 100, Duration::from_micros(41_667), Duration::from_millis(600));
+    (missing, s.caller.stats().clone(), s.conn().stats().clone())
+}
+
+/// Jitter with LOSSMAXTTL 0: once the path is seen to reorder, holes wait the
+/// observed lateness before their first NAK (auto_reorder): far fewer NAKs
+/// and needless retransmissions, and still no loss (with 1 % real loss too).
+#[test]
+fn auto_reorder_cuts_spurious_naks_under_jitter() {
+    for pct in [0.0, 1.0] {
+        let (m0, c0, r0) = jitter_run(false, pct, 77);
+        let (m1, c1, r1) = jitter_run(true, pct, 77);
+        eprintln!("loss {pct}%: off: naks {} retrans {} dup {} | auto: naks {} retrans {} dup {} reordered {}",
+            r0.nak_seqs_sent, c0.pkt_retrans, r0.pkt_rcv_duplicate, r1.nak_seqs_sent, c1.pkt_retrans, r1.pkt_rcv_duplicate, r1.pkt_rcv_reordered);
+        assert_eq!((m0, m1), (0, 0), "loss {pct}");
+        assert!(r1.pkt_rcv_reordered > 100);
+        assert!(c1.pkt_retrans * 20 < c0.pkt_retrans, "auto {} off {}", c1.pkt_retrans, c0.pkt_retrans);
+    }
+}

@@ -268,6 +268,19 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   Sim: a peer ACKing ~20 ms after the newest packet, RTT 2 ms, 96 frames:
   96 tail probes before, 2 after; a lost tail is still repaired in time.
 
+## Reordering with LOSSMAXTTL 0 (rs2)
+
+- `auto_reorder` (default on, receiver timing only): with LOSSMAXTTL 0 a
+  reordered packet is NAKed at once and retransmitted for nothing. When an
+  original (R = 0) packet fills a hole, its lateness (arrival - detection)
+  + 0.5 ms is kept as a max over two 1 s windows; new holes then wait that
+  long before their first NAK (the LOSSMAXTTL waiting suffix, time-bound
+  only), capped at min(latency / 8, max(SRTT / 2, 2 ms)). No reordering for
+  2 s: back to NAK at once. LOSSMAXTTL > 0 keeps its own rule.
+  Sim, 0-10 ms uniform jitter on data, RTT 30, L 120, 9600 packets:
+  9056 needless retransmissions without, 66 with; with 1 % loss also no
+  frame lost.
+
 ## srt-mio
 
 - `SrtSocket::connect(local, remote, cfg)`: non-blocking; the handshake
