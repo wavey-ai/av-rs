@@ -564,7 +564,12 @@ fn random_loss_5pct_both_ways_rtt30_l120() {
     // tail probes add a few); duplicates few
     assert!(c.pkt_retrans < r.pkt_rcv_loss * 14 / 10, "retrans {} loss {}", c.pkt_retrans, r.pkt_rcv_loss);
     // duplicates: mostly the deliberate second copies of late repairs
-    assert!(r.pkt_rcv_duplicate <= c.pkt_rexmit_copies + r.pkt_rcv_loss / 20, "dup {} loss {}\n{c:?}", r.pkt_rcv_duplicate, r.pkt_rcv_loss);
+    assert!(
+        r.pkt_rcv_duplicate <= c.pkt_rexmit_copies + r.pkt_rcv_loss / 20,
+        "dup {} loss {}\n{c:?}",
+        r.pkt_rcv_duplicate,
+        r.pkt_rcv_loss
+    );
     assert!(c.pkt_rexmit_copies < r.pkt_rcv_loss / 4, "{c:?}");
     assert_eq!((c.ack_invalid, c.nak_invalid), (0, 0));
 }
@@ -677,7 +682,13 @@ fn reorder_tolerance_suppresses_nak_for_late_packet() {
     s.connect();
     // seq 902 arrives 300 us late (after the other 7 of its burst: fewer
     // than 10 packets and well within the 2 ms reorder window)
-    s.delay = Box::new(|side, d| if side == "a" && data_seq(d) == Some(902) { Duration::from_micros(300) } else { Duration::ZERO });
+    s.delay = Box::new(|side, d| {
+        if side == "a" && data_seq(d) == Some(902) {
+            Duration::from_micros(300)
+        } else {
+            Duration::ZERO
+        }
+    });
     let (_, missing) = run_frames(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(300));
     assert_eq!(missing, 0);
     let r = s.conn().stats().clone();
@@ -819,4 +830,314 @@ fn late_nak_copy_is_delayed_and_acks_floor_rttvar() {
     assert_eq!(naks[0].0, naks[1].0);
     assert_eq!(naks[2].1, naks[3].1);
     assert!(naks[3].0 - naks[2].0 >= 10_000, "{naks:?}");
+}
+
+// ---------------------------------------------------------------- FEC (stage 3)
+
+fn is_fec(d: &[u8]) -> bool {
+    matches!(packet::decode(d), Ok(Packet::Data { hdr, .. }) if hdr.msgno == 0)
+}
+
+fn fcfg(lat: u16, filter: &str) -> Config {
+    Config {
+        packet_filter: Some(filter.to_string()),
+        ..cfg(lat)
+    }
+}
+
+fn vmsg(i: u32) -> Vec<u8> {
+    let len = 200 + (i as usize * 97) % 1117;
+    let mut m: Vec<u8> = (0..len).map(|j| (i as usize * 31 + j * 7) as u8).collect();
+    m[..4].copy_from_slice(&i.to_be_bytes());
+    m
+}
+
+/// As `run_frames`, with messages of varying length and content, every
+/// delivered payload checked byte for byte.
+fn run_frames_v(s: &mut Sim, frames: usize, per_frame: usize, interval: Duration, tail: Duration) -> (Vec<Duration>, usize) {
+    let mut sent_at: Vec<Instant> = Vec::new();
+    let mut lat = Vec::new();
+    let start = s.now;
+    let mut next_frame = start;
+    let mut sent_frames = 0;
+    let mut got = std::collections::HashSet::new();
+    s.run_until(interval * frames as u32 + tail, |s| {
+        if sent_frames < frames && s.now >= next_frame {
+            for _ in 0..per_frame {
+                let i = sent_at.len() as u32;
+                s.caller.send_message(s.now, &vmsg(i), None).unwrap();
+                sent_at.push(s.now);
+            }
+            sent_frames += 1;
+            next_frame += interval;
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            let i = u32::from_be_bytes(m.payload[..4].try_into().unwrap());
+            assert_eq!(m.payload, &vmsg(i)[..], "payload of {i}");
+            assert!(got.insert(i), "delivered twice: {i}");
+            lat.push(now - sent_at[i as usize]);
+        }
+        false
+    });
+    (lat, sent_at.len() - got.len())
+}
+
+#[test]
+fn fec_negotiation_mismatch_rejects_and_merge_connects() {
+    let mut s = Sim::new(fcfg(120, "fec,cols:20"), fcfg(120, "fec,cols:10,rows:5"), 15, 9);
+    s.run_until(Duration::from_secs(2), |s| s.caller.is_closed());
+    assert_eq!(s.caller.state(), &State::Closed(CloseReason::Rejected(srt_core::RejectReason::Filter)));
+    // listener "fec" + caller's full config: merged, both sides run it
+    let mut s = Sim::new(fcfg(120, "fec,cols:10,rows:5,layout:even,arq:never"), fcfg(120, "fec"), 15, 9);
+    s.connect();
+    let f = s.caller.fec_config().unwrap();
+    assert_eq!((f.cols, f.rows, f.staircase, f.arq), (10, 5, false, srt_core::fec::ArqLevel::Never));
+    assert_eq!(s.conn().fec_config(), Some(f));
+    // a caller without a filter: the listener drops its own
+    let mut s = Sim::new(cfg(120), fcfg(120, "fec,cols:10"), 15, 9);
+    s.connect();
+    assert!(s.caller.fec_config().is_none() && s.conn().fec_config().is_none());
+    assert_eq!(s.caller.max_message(), 1316);
+}
+
+#[test]
+fn fec_row_only_arq_never_rebuilds_without_naks() {
+    let f = "fec,cols:10,rows:1,arq:never";
+    let mut s = Sim::new(fcfg(120, f), fcfg(120, f), 15, 0x7FFF_FFF0); // across the wrap
+    s.connect();
+    let isn = 0x7FFF_FFF0u32;
+    // one loss in each of rows 0..=5 (row 5: its last packet), two in row 7
+    let lost: Vec<u32> = [3, 11, 25, 37, 42, 59, 71, 75].iter().map(|k| (isn + k) & 0x7FFF_FFFF).collect();
+    let l2 = lost.clone();
+    s.drop = Box::new(move |side, d| side == "a" && !is_fec(d) && data_seq(d).map_or(false, |q| l2.contains(&q)));
+    let (lat, missing) = run_frames_v(&mut s, 4, 20, Duration::from_millis(40), Duration::from_millis(400));
+    let r = s.conn().stats().clone();
+    let c = s.caller.stats().clone();
+    assert_eq!(missing, 2, "row 7 had two losses: arq:never cannot repair them");
+    assert_eq!(r.pkt_rcv_filter_supply, 6, "{r:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_300)), "{lat:?}");
+    // 8 rows of 10 -> 8 FEC packets, nothing retransmitted, no NAK
+    assert_eq!((c.pkt_snd_filter_extra, r.pkt_rcv_filter_extra), (8, 8));
+    assert_eq!((r.pkt_sent_nak, c.pkt_retrans, c.pkt_tail_probe, c.pkt_head_probe), (0, 0, 0, 0), "{c:?}");
+    assert_eq!(c.pkt_sent, 80 + 8);
+}
+
+#[test]
+fn fec_onreq_naks_only_what_fec_cannot_rebuild() {
+    // 2D staircase 10 x 5. Row 2 (k 20..29) loses 26 and 27; their column
+    // groups ({16..56}, {27..67}) lose nothing else, so the columns
+    // rebuild both. Rows 3 and 4 lose 30, 31, 40, 41: 30/40 share column
+    // group {0..40} and 31/41 {11..51}, so nothing can rebuild them and
+    // they are NAKed; the first NAK and the first two copies of 40 are
+    // lost (libsrt's onreq would never NAK them again). Ours re-NAKs.
+    let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+    let mut s = Sim::new(fcfg(200, f), fcfg(200, f), 15, 1000);
+    s.connect();
+    s.run_until(Duration::from_millis(200), |_| false); // RTT known
+    let (mut n1040, mut naks) = (0, 0);
+    s.drop = Box::new(move |side, d| {
+        if let (true, Ok(Packet::Data { hdr, .. })) = (side == "a", packet::decode(d)) {
+            if hdr.msgno != 0 && [1026, 1027, 1030, 1031, 1041].contains(&hdr.seq) {
+                return !hdr.rexmit;
+            }
+            if hdr.msgno != 0 && hdr.seq == 1040 {
+                n1040 += 1;
+                return n1040 <= 2;
+            }
+        }
+        if side == "b" && ctl_type(d) == Some(packet::ctrl::NAK) {
+            naks += 1;
+            return naks == 1;
+        }
+        false
+    });
+    let (lat, missing) = run_frames_v(&mut s, 2, 100, Duration::from_millis(40), Duration::from_millis(600));
+    let r = s.conn().stats().clone();
+    let c = s.caller.stats().clone();
+    assert_eq!(missing, 0, "rcv {r:?}\nsnd {c:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(215_300)), "{lat:?}");
+    // 26 and 27 by their columns; then, once repairs of 30/31 arrive,
+    // their column groups can rebuild 40/41 (FEC and ARQ cooperate)
+    assert!(r.pkt_rcv_filter_supply >= 2, "{r:?}");
+    // only the four FEC could not rebuild were handed to NAK
+    assert_eq!(r.pkt_rcv_filter_loss, 4, "{r:?}");
+    assert!(r.pkt_sent_nak >= 2 && c.pkt_retrans >= 2, "rcv {r:?}\nsnd {c:?}");
+    assert_eq!(r.pkt_rcv_drop, 0);
+    // 200 packets: 20 row FEC + 10 x 4 columns complete (staircase heads
+    // excepted)
+    assert!(c.pkt_snd_filter_extra >= 50, "{c:?}");
+}
+
+#[test]
+fn fec_onreq_renaks_after_lost_nak_and_lost_repair() {
+    // row only: 40 and 41 in one row, unrebuildable. Both copies of the
+    // first NAK and the first repair of 40 are lost; libsrt's onreq NAKs
+    // a loss once and would lose 40. Ours NAKs it again.
+    let f = "fec,cols:10,rows:1,arq:onreq";
+    let mut s = Sim::new(
+        Config {
+            tail_probe: false,
+            ..fcfg(200, f)
+        },
+        fcfg(200, f),
+        15,
+        1000,
+    );
+    s.connect();
+    s.run_until(Duration::from_millis(200), |_| false); // RTT known
+    let (mut n1040, mut naks) = (0, 0);
+    s.drop = Box::new(move |side, d| {
+        if let (true, Ok(Packet::Data { hdr, .. })) = (side == "a", packet::decode(d)) {
+            if hdr.msgno != 0 && hdr.seq == 1041 {
+                return !hdr.rexmit;
+            }
+            if hdr.msgno != 0 && hdr.seq == 1040 {
+                n1040 += 1;
+                return n1040 <= 2;
+            }
+        }
+        if side == "b" && ctl_type(d) == Some(packet::ctrl::NAK) {
+            naks += 1;
+            return naks <= 2;
+        }
+        false
+    });
+    let (lat, missing) = run_frames_v(&mut s, 2, 100, Duration::from_millis(40), Duration::from_millis(600));
+    let r = s.conn().stats().clone();
+    let c = s.caller.stats().clone();
+    assert_eq!(missing, 0, "rcv {r:?}\nsnd {c:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(215_300)), "{lat:?}");
+    assert_eq!((r.pkt_rcv_filter_loss, r.pkt_rcv_drop), (2, 0), "{r:?}");
+    // NAKed more than once (the sender's ACK-head retransmission may also
+    // have repaired 40)
+    assert!(r.pkt_sent_nak >= 3 && r.nak_seqs_sent >= 3, "{r:?}");
+}
+
+#[test]
+fn fec_tail_loss_is_seen_from_the_fec_packet() {
+    // the last two packets of a burst (= the end of row 0) are lost; the
+    // row FEC that follows them reveals the loss at once (no wait for the
+    // next burst, no tail probe needed) and, two missing, it is NAKed
+    let f = "fec,cols:10,rows:1,arq:onreq";
+    let ccfg = Config {
+        tail_probe: false,
+        ..fcfg(120, f)
+    };
+    let mut s = Sim::new(ccfg, fcfg(120, f), 15, 100);
+    s.connect();
+    s.drop = Box::new(|side, d| {
+        side == "a" && !is_fec(d) && matches!(packet::decode(d), Ok(Packet::Data { hdr, .. }) if !hdr.rexmit && (hdr.seq == 108 || hdr.seq == 109))
+    });
+    let (lat, missing) = run_frames_v(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(400));
+    let r = s.conn().stats().clone();
+    assert_eq!(missing, 0, "{r:?}");
+    // (pktRcvLossTotal counts gaps in the arrival sequence, as libsrt: none
+    // here, the tail was never followed by a later packet)
+    assert_eq!((r.pkt_rcv_fec_tail_loss, r.pkt_rcv_filter_loss, r.pkt_rcv_loss), (2, 2, 0), "{r:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_300)), "{lat:?}");
+    // and with a single tail loss the FEC rebuilds it: no loss at all
+    let mut s = Sim::new(
+        Config {
+            tail_probe: false,
+            ..fcfg(120, f)
+        },
+        fcfg(120, f),
+        15,
+        100,
+    );
+    s.connect();
+    s.drop = Box::new(|side, d| side == "a" && !is_fec(d) && data_seq(d) == Some(109));
+    let (_, missing) = run_frames_v(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(400));
+    let r = s.conn().stats().clone();
+    assert_eq!((missing, r.pkt_rcv_filter_supply, r.pkt_rcv_loss, r.pkt_sent_nak), (0, 1, 0, 0), "{r:?}");
+}
+
+#[test]
+fn fec_random_loss_5pct_both_ways_staircase_onreq() {
+    let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+    let mut s = Sim::new(fcfg(120, f), fcfg(120, f), 15, 77);
+    s.connect();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    s.drop = Box::new(move |_, _| rng.chance(5.0));
+    let (lat, missing) = run_frames_v(&mut s, 48, 100, Duration::from_micros(41_667), Duration::from_millis(500));
+    let r = s.conn().stats().clone();
+    let c = s.caller.stats().clone();
+    assert_eq!(missing, 0, "rcv {r:?}\nsnd {c:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_300)));
+    // FEC rebuilt most losses; retransmissions well below the losses
+    assert!(r.pkt_rcv_filter_supply > r.pkt_rcv_loss / 2, "rcv {r:?}");
+    assert!(
+        c.pkt_retrans < r.pkt_rcv_loss * 7 / 10,
+        "retrans {} loss {}\nrcv {r:?}",
+        c.pkt_retrans,
+        r.pkt_rcv_loss
+    );
+    assert_eq!((c.ack_invalid, c.nak_invalid), (0, 0));
+}
+
+#[test]
+fn fec_random_loss_both_layouts_and_directions() {
+    for (f, owd, lat, pct) in [
+        ("fec,cols:10,rows:5,layout:even,arq:onreq", 15, 120, 5.0),
+        ("fec,cols:20,rows:1,arq:onreq", 15, 120, 5.0),
+        ("fec,cols:8,rows:-4,layout:staircase,arq:always", 15, 120, 5.0),
+        ("fec,cols:10,rows:5,layout:staircase,arq:onreq", 125, 1000, 5.0),
+    ] {
+        // listener -> caller
+        let mut s = Sim::new(fcfg(lat, f), fcfg(lat, f), owd, 3);
+        s.connect();
+        let mut rng = Rng(12345);
+        s.drop = Box::new(move |_, _| rng.chance(pct));
+        let mut sent = 0u32;
+        let mut got = Vec::new();
+        let start = s.now;
+        let run = Duration::from_millis(lat as u64 + 2 * owd + 1500);
+        s.run_until(run, |s| {
+            if s.now - start < Duration::from_millis(1000) && (s.now - start).as_micros() % 10_000 < 50 {
+                for _ in 0..30 {
+                    let now = s.now;
+                    s.conn().send_message(now, &vmsg(sent), None).unwrap();
+                    sent += 1;
+                }
+            }
+            while let Some(m) = s.caller.recv_message(s.now) {
+                let i = u32::from_be_bytes(m.payload[..4].try_into().unwrap());
+                assert_eq!(m.payload, &vmsg(i)[..]);
+                got.push(i);
+            }
+            false
+        });
+        let r = s.caller.stats().clone();
+        assert_eq!(got, (0..sent).collect::<Vec<_>>(), "{f}\nrcv {r:?}\nsnd {:?}", s.conn().stats());
+        assert!(r.pkt_rcv_filter_supply > 0 && r.pkt_rcv_filter_extra > 0, "{f} {r:?}");
+    }
+}
+
+#[test]
+fn fec_large_drop_is_naked_not_dropped_silently() {
+    // a 700-packet outage (more than 10 matrices of 10 x 5 would be 500 in
+    // libsrt's reset rule): every lost packet is NAKed and repaired
+    let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+    let mut s = Sim::new(fcfg(400, f), fcfg(400, f), 15, 10);
+    s.connect();
+    s.run_until(Duration::from_millis(100), |_| false);
+    let mut first = true;
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && matches!(packet::decode(d), Ok(Packet::Data { hdr, .. }) if !hdr.rexmit) {
+            let q = data_seq(d).unwrap();
+            if (300..1000).contains(&q) && first {
+                if q == 999 {
+                    first = false;
+                }
+                return true;
+            }
+        }
+        false
+    });
+    let (_, missing) = run_frames_v(&mut s, 10, 200, Duration::from_millis(20), Duration::from_millis(1000));
+    let r = s.conn().stats().clone();
+    assert_eq!(missing, 0, "{r:?}");
+    assert_eq!(r.pkt_rcv_drop, 0);
+    assert!(r.pkt_rcv_filter_loss >= 690, "{r:?}");
 }

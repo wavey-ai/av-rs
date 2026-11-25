@@ -100,6 +100,10 @@ pub(crate) fn negotiate(cfg: &Config, hs: &Handshake) -> Result<Negotiated, Reje
         }
     }
     let filter = crate::filter::negotiate_listener(cfg.packet_filter.as_deref(), hs.filter.as_deref()).map_err(|_| RejectReason::Filter)?;
+    // only the built-in `fec` exists (libsrt rejects other types too)
+    if filter.as_deref().map_or(false, |f| crate::fec::FecConfig::parse(f).is_none()) {
+        return Err(RejectReason::Filter);
+    }
     let mss = cfg.mss.min(hs.mss);
     if (mss as usize) < PKT_OVERHEAD + 32 {
         return Err(RejectReason::Rogue);

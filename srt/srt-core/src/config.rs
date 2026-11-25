@@ -31,8 +31,14 @@ pub struct Config {
     pub overhead_bw_pct: u32,
     /// [SRTO_STREAMID] (caller), at most 512 bytes.
     pub stream_id: Option<String>,
-    /// [SRTO_PACKETFILTER]; negotiated and carried, FEC itself not yet implemented.
+    /// [SRTO_PACKETFILTER]: the libsrt `fec` filter
+    /// (`fec,cols:C[,rows:R][,layout:even|staircase][,arq:never|onreq|always]`),
+    /// negotiated in the handshake. Needs payload_size <= 1452.
     pub packet_filter: Option<String>,
+    /// FEC with `arq:onreq`/`always`: the longest a new loss waits for the
+    /// filter before its first NAK, us (0 = from the latency and RTT, see
+    /// `Connection`). Not an SRT option.
+    pub fec_nak_cap_us: u32,
     /// [SRTO_CONNTIMEO]: how long the caller keeps re-sending on the same socket.
     pub connect_timeout: Duration,
     /// [SRTO_PEERIDLETIMEO].
@@ -94,6 +100,7 @@ impl Default for Config {
             overhead_bw_pct: 25,
             stream_id: None,
             packet_filter: None,
+            fec_nak_cap_us: 0,
             connect_timeout: Duration::from_secs(8),
             peer_idle_timeout: Duration::from_secs(5),
             tsbpd: true,

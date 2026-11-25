@@ -251,6 +251,53 @@ impl RcvLossList {
         n
     }
 
+    /// The packet filter found `first..=last` unrebuildable: bring the
+    /// first NAK of the not yet NAKed sequences in it forward to `now_us`
+    /// (runs are split so the rest keep waiting for FEC). Returns how many
+    /// sequences were released.
+    pub fn release_range(&mut self, first: u32, last: u32, now_us: i64) -> u64 {
+        if seq_lt(last, first) {
+            return 0;
+        }
+        let mut n = 0u64;
+        let mut i = self.holes.partition_point(|h| seq_lt(h.last, first));
+        while i < self.holes.len() {
+            let h = self.holes[i];
+            if seq_lt(last, h.first) {
+                break;
+            }
+            if h.naks > 0 || h.next_nak_us <= now_us || self.is_waiting(i) {
+                i += 1;
+                continue;
+            }
+            let cut_first = if seq_lt(h.first, first) { first } else { h.first };
+            let cut_last = if seq_lt(last, h.last) { last } else { h.last };
+            n += (seq_off(cut_first, cut_last) + 1) as u64;
+            let mut mid = h;
+            mid.first = cut_first;
+            mid.last = cut_last;
+            mid.next_nak_us = now_us;
+            if seq_lt(h.first, cut_first) {
+                self.holes[i].last = seq_dec(cut_first);
+                i += 1;
+                self.holes.insert(i, mid);
+            } else {
+                self.holes[i] = mid;
+            }
+            if seq_lt(cut_last, h.last) {
+                let mut tail = h;
+                tail.first = seq_inc(cut_last);
+                self.holes.insert(i + 1, tail);
+                i += 1;
+            }
+            i += 1;
+        }
+        if n > 0 {
+            self.next_due = self.next_due.min(now_us);
+        }
+        n
+    }
+
     /// The re-NAK interval shrank (first RTT sample, or the repair time
     /// fell): bring every NAKed run's next NAK forward to its last NAK +
     /// `interval_us`.
@@ -284,7 +331,16 @@ impl RcvLossList {
     /// late attempt (NAKed before, or with no time for another round after
     /// this one). Also recomputes `next_due`.
     #[allow(clippy::too_many_arguments)]
-    pub fn collect_due(&mut self, now_us: i64, slack_us: i64, interval_us: i64, min_repair_us: i64, reserve_us: i64, max_words: usize, out: &mut Vec<(u32, u32)>) -> (u64, bool) {
+    pub fn collect_due(
+        &mut self,
+        now_us: i64,
+        slack_us: i64,
+        interval_us: i64,
+        min_repair_us: i64,
+        reserve_us: i64,
+        max_words: usize,
+        out: &mut Vec<(u32, u32)>,
+    ) -> (u64, bool) {
         out.clear();
         let mut words = 0usize;
         let mut seqs = 0u64;
@@ -471,6 +527,40 @@ mod tests {
         l.fill(13);
         assert!(l.is_empty());
         assert_eq!(l.seqs(), 0);
+    }
+
+    #[test]
+    fn release_range_splits_deferred_runs() {
+        const LATER: i64 = 50_000;
+        // q(29) = SEQ_MAX - 1: the second run crosses the wrap
+        let q = |x: i32| seq_add(SEQ_MAX - 30, x);
+        let mut l = RcvLossList::new();
+        l.push(hole(q(10), q(19), LATER), false); // waiting for FEC
+        l.push(hole(q(29), q(33), LATER), false);
+        assert_eq!(l.next_due(), LATER);
+        // the middle of a run: split in three
+        assert_eq!(l.release_range(q(12), q(13), 1000), 2);
+        assert_eq!(l.snapshot(), vec![(q(10), q(11)), (q(12), q(13)), (q(14), q(19)), (q(29), q(33))]);
+        assert_eq!(l.next_due(), 1000);
+        // overlapping a released run: only the new part counts
+        assert_eq!(l.release_range(q(13), q(15), 2000), 2);
+        assert_eq!(
+            l.snapshot(),
+            vec![(q(10), q(11)), (q(12), q(13)), (q(14), q(15)), (q(16), q(19)), (q(29), q(33))]
+        );
+        // the tail of a run, across the wrap
+        assert_eq!(l.release_range(0, 2, 3000), 3);
+        assert_eq!(
+            l.snapshot(),
+            vec![(q(10), q(11)), (q(12), q(13)), (q(14), q(15)), (q(16), q(19)), (q(29), SEQ_MAX), (0, 2)]
+        );
+        let mut out = Vec::new();
+        let (n, _) = l.collect_due(3000, 0, 10_000, 0, 0, 100, &mut out);
+        assert_eq!((n, out), (7, vec![(q(12), q(13)), (q(14), q(15)), (0, 2)]));
+        // NAKed runs are not touched; the rest is released
+        assert_eq!(l.release_range(q(12), q(15), 4000), 0);
+        assert_eq!(l.seqs(), 15);
+        assert_eq!(l.release_range(q(0), 100, 5000), 2 + 4 + 2);
     }
 
     #[test]

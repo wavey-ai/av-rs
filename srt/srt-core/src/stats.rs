@@ -21,6 +21,7 @@ pub struct Stats {
     pub byte_snd_drop: u64,
     /// Of those, packets that had never been sent.
     pub pkt_snd_drop_unsent: u64,
+    /// FEC packets sent (pktSndFilterExtraTotal; also in pkt_sent).
     pub pkt_snd_filter_extra: u64,
     pub pkt_recv_ack: u64,
     pub pkt_recv_light_ack: u64,
@@ -70,8 +71,14 @@ pub struct Stats {
     pub pkt_rcv_too_far: u64,
     /// FEC packets received (pktRcvFilterExtraTotal).
     pub pkt_rcv_filter_extra: u64,
+    /// Packets rebuilt by FEC (pktRcvFilterSupplyTotal).
     pub pkt_rcv_filter_supply: u64,
+    /// Losses the filter found unrebuildable and handed to NAK
+    /// (pktRcvFilterLossTotal; libsrt counts what its `onreq` reports).
     pub pkt_rcv_filter_loss: u64,
+    /// Losses found from a FEC packet's sequence (the tail of a burst),
+    /// before any later data packet.
+    pub pkt_rcv_fec_tail_loss: u64,
     /// Data packets with a non-zero key (we do not decrypt).
     pub pkt_rcv_undecrypt: u64,
     pub pkt_sent_ack: u64,

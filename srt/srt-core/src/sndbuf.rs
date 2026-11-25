@@ -325,9 +325,16 @@ mod tests {
         }
         assert!((p.rate() - 2_500_000.0).abs() < 10_000.0, "{}", p.rate());
         // explicit INPUTBW via Config: 1 MB/s x 1.25
-        let c = crate::Config { max_bw: 0, input_bw: 1_000_000, ..crate::Config::default() };
+        let c = crate::Config {
+            max_bw: 0,
+            input_bw: 1_000_000,
+            ..crate::Config::default()
+        };
         assert_eq!(c.fixed_pacing_rate(), Some(1_250_000.0));
-        let c = crate::Config { max_bw: 3_000_000, ..crate::Config::default() };
+        let c = crate::Config {
+            max_bw: 3_000_000,
+            ..crate::Config::default()
+        };
         assert_eq!(c.fixed_pacing_rate(), Some(3_000_000.0));
         assert_eq!(crate::Config::default().fixed_pacing_rate(), Some(125_000_000.0));
     }

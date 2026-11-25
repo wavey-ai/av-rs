@@ -6,11 +6,13 @@
 //!
 //! Loss recovery: receiver loss list with a NAK schedule per hole, sender
 //! retransmission ahead of new data, DROPREQ, sender drop and a tail probe
-//! (spec 6, 7, 12). The FEC packet filter is a later stage; packet-filter
-//! configs are already negotiated and carried.
+//! (spec 6, 7, 12). The libsrt `fec` packet filter (spec 8): row/column
+//! XOR groups in both layouts, iterative rebuild, arq never/onreq/always
+//! with NAKs that, unlike libsrt's, are repeated (`fec`).
 
 pub mod config;
 pub mod conn;
+pub mod fec;
 pub mod filter;
 pub mod handshake;
 pub mod listener;

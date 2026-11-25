@@ -7,9 +7,10 @@
 //! every timestamp this side puts on the wire.
 
 use crate::config::Config;
+use crate::fec::{ArqLevel, FecConfig, FecRx, FecTx};
 use crate::handshake::{flags, ip_to_words, req, Handshake, RejectReason, SrtHsExt, HS_MAGIC, SRT_VERSION, UDT_DGRAM};
 use crate::losslist::{Hole, RcvLossList, SndLossList, NEVER};
-use crate::packet::{self, Ack, AckKind, Control, DataHeader, LossList, Packet, HDR_LEN, PKT_OVERHEAD};
+use crate::packet::{self, rd32, Ack, AckKind, Control, DataHeader, LossList, Packet, HDR_LEN, PKT_OVERHEAD};
 use crate::rcvbuf::{Insert, RcvBuf};
 use crate::seq::{ackno_inc, seq_dec, seq_inc, seq_le, seq_lt, seq_off};
 use crate::sndbuf::{Pacer, SndBuf};
@@ -60,6 +61,12 @@ const LAST_CHANCE_MARGIN_US: i64 = 5_000;
 /// Sender drop: hold a packet at least latency + max(latency / 4, this)
 /// (+ 2 SRTT + 10 ms) past its origin (spec 12 #8; libsrt holds >= 1 s).
 const SND_DROP_MARGIN_US: i64 = 20_000;
+/// FEC receiver: group history kept, packets (at most the receive buffer).
+const FEC_RX_WINDOW: u32 = 4096;
+/// FEC (`arq:onreq`/`always`): the first NAK of a loss waits for the filter
+/// to find it unrebuildable, at most this long at least (see
+/// `fec_nak_cap_us`).
+const FEC_NAK_CAP_MIN_US: i64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -236,6 +243,20 @@ pub struct Connection {
     /// A sequence to send once more right after its retransmission.
     rexmit_copy: Option<u32>,
 
+    // packet filter (FEC)
+    fec_tx: Option<Box<FecTx>>,
+    fec_rx: Option<Box<FecRx>>,
+    /// The filter's ARQ level (None: no filter = libsrt's "always" without
+    /// FEC).
+    arq: Option<ArqLevel>,
+    /// Offsets the filter found unrebuildable (scratch).
+    fec_rel: Vec<i64>,
+    /// Timestamp of the newest data packet received (deadline of a loss
+    /// a FEC packet reveals).
+    last_data_ts: u32,
+    /// Highest sequence of any data packet received (loss statistics).
+    phy_highest: u32,
+
     // RTT
     srtt: u32,
     rttvar: u32,
@@ -331,6 +352,12 @@ impl Connection {
             nak_copy: Vec::new(),
             nak_copy_at_us: NEVER,
             rexmit_copy: None,
+            fec_tx: None,
+            fec_rx: None,
+            arq: None,
+            fec_rel: Vec::new(),
+            last_data_ts: 0,
+            phy_highest: seq_dec(isn),
             srtt: INIT_RTT_US,
             rttvar: INIT_RTTVAR_US,
             rtt_own: false,
@@ -391,6 +418,7 @@ impl Connection {
         c.tsbpd = Some(Tsbpd::new(0, hs_timestamp, n.rcv_latency_ms, c.cfg.drift_tracer));
         let send_filter = n.filter.is_some() && n.peer_flags & flags::FILTERCAP != 0;
         c.filter = n.filter;
+        c.setup_filter(); // the listener checked the config
         let mut rsp = Handshake {
             version: 5,
             encryption: 0,
@@ -485,7 +513,43 @@ impl Connection {
 
     /// Largest message `send_message` accepts.
     pub fn max_message(&self) -> usize {
-        self.cfg.payload_size.min(self.max_payload)
+        let m = self.cfg.payload_size.min(self.max_payload);
+        if self.fec_tx.is_some() {
+            m.min(self.max_payload - 4) // a FEC packet carries 4 bytes more
+        } else {
+            m
+        }
+    }
+
+    /// The `fec` filter in use (negotiated), if any.
+    pub fn fec_config(&self) -> Option<FecConfig> {
+        self.fec_rx.as_ref().map(|r| r.cfg)
+    }
+
+    /// Set up the packet filter from the negotiated config (spec 8): both
+    /// directions are grouped from the caller's ISN. False if it is not a
+    /// `fec` filter we can run.
+    fn setup_filter(&mut self) -> bool {
+        self.fec_tx = None;
+        self.fec_rx = None;
+        self.arq = None;
+        let Some(f) = self.filter.as_deref() else { return true };
+        let Some(fc) = FecConfig::parse(f) else { return false };
+        // P: the sender's SRTO_PAYLOADSIZE, as libsrt (a libsrt receiver
+        // abandons rebuilds longer than its own)
+        let p = self.cfg.payload_size.min(self.max_payload - 4);
+        self.fec_tx = Some(Box::new(FecTx::new(&fc, p, self.isn)));
+        let window = self.rcv.capacity().min(FEC_RX_WINDOW);
+        self.fec_rx = Some(Box::new(FecRx::new(&fc, self.max_payload, self.isn, window)));
+        self.arq = Some(fc.arq);
+        true
+    }
+
+    /// Our sender may retransmit on its own (ACK-head, probes): not with
+    /// `arq:never`, which asks for FEC only.
+    #[inline]
+    fn sender_arq(&self) -> bool {
+        self.arq != Some(ArqLevel::Never)
     }
 
     /// Packets held by the sender (sent-unacknowledged + unsent).
@@ -760,6 +824,9 @@ impl Connection {
         self.peer_flags = rsp.flags;
         self.peer_version = rsp.version;
         self.filter = filter;
+        if !self.setup_filter() {
+            return reject(self, RejectReason::Filter);
+        }
         self.snd_latency_ms = if rsp.flags & flags::TSBPDRCV != 0 { rsp.recv_delay_ms } else { 0 };
         self.rcv_latency_ms = if rsp.flags & flags::TSBPDSND != 0 { rsp.send_delay_ms } else { 0 };
         self.tsbpd_rcv = self.cfg.tsbpd && rsp.flags & flags::TSBPDSND != 0;
@@ -775,6 +842,9 @@ impl Connection {
         if hdr.msgno == 0 {
             // packet-filter (FEC) packet: never enters the buffer
             st.pkt_rcv_filter_extra += 1;
+            if self.fec_rx.is_some() {
+                self.on_fec_packet(now_us, hdr, payload);
+            }
             return;
         }
         if hdr.key != 0 {
@@ -788,6 +858,16 @@ impl Connection {
         if hdr.rexmit {
             st.pkt_rcv_retrans += 1;
         }
+        // loss as libsrt counts it: gaps in the arrival sequence, before
+        // any FEC rebuild
+        let d = seq_off(self.phy_highest, hdr.seq);
+        if d > 1 {
+            st.pkt_rcv_loss += (d - 1) as u64;
+            st.byte_rcv_loss += (d - 1) as u64 * (payload.len() + PKT_OVERHEAD) as u64;
+        }
+        if d > 0 {
+            self.phy_highest = hdr.seq;
+        }
         if !self.rcv_started {
             self.rcv_started = true;
             self.next_ack_us = now_us + SYN_US;
@@ -795,38 +875,146 @@ impl Connection {
         }
         match self.rcv.insert(hdr.seq, payload, hdr.timestamp, hdr.msgno, hdr.rexmit) {
             Insert::Stored { loss, filled_hole } => {
-                st.pkt_recv_unique += 1;
-                st.byte_recv_unique += (payload.len() + PKT_OVERHEAD) as u64;
-                self.rate_pkts += 1;
-                self.rate_bytes += (payload.len() + PKT_OVERHEAD) as u64;
-                self.rcv_pkt_count += 1;
-                if let Some((a, b)) = loss {
-                    let n = (seq_off(a, b) + 1) as u64;
-                    st.pkt_rcv_loss += n;
-                    st.byte_rcv_loss += n * (payload.len() + PKT_OVERHEAD) as u64;
-                    self.on_loss(now_us, a, b, hdr.timestamp);
+                if !hdr.rexmit {
+                    self.last_data_ts = hdr.timestamp;
                 }
-                if filled_hole {
-                    if let Some(f) = self.rcv_loss.fill(hdr.seq) {
-                        self.stats.pkt_rcv_repaired += 1;
-                        if hdr.rexmit && f.naks == 1 {
-                            self.nak_rtt_sample(now_us - f.last_nak_us);
+                self.on_stored(now_us, hdr.seq, hdr.timestamp, payload.len(), hdr.rexmit, false, loss, filled_hole);
+                if let Some(mut rx) = self.fec_rx.take() {
+                    rx.feed(hdr.seq, payload, hdr.timestamp, hdr.key, None);
+                    self.fec_rebuild(now_us, &mut rx);
+                    if !hdr.rexmit {
+                        // groups ending before this packet are closed
+                        let mut rel = std::mem::take(&mut self.fec_rel);
+                        rel.clear();
+                        if rx.advance(hdr.seq, &self.rcv, &mut rel) {
+                            // beyond the group history: nothing before it
+                            // can be rebuilt any more
+                            let base = self.rcv.base;
+                            self.fec_release_range(now_us, base, seq_dec(hdr.seq));
                         }
+                        self.fec_release(now_us, &rx, &mut rel);
+                        self.fec_rel = rel;
                     }
-                }
-                if self.cfg.loss_max_ttl > 0 && self.rcv_loss.oldest_waiting().is_some() {
-                    let w = self.cfg.reorder_window_us as i64;
-                    self.rcv_loss.release_waiting(now_us, self.rcv_pkt_count, self.cfg.loss_max_ttl, w);
+                    self.fec_rx = Some(rx);
                 }
             }
-            Insert::Belated => st.pkt_rcv_belated += 1,
-            Insert::Duplicate => st.pkt_rcv_duplicate += 1,
-            Insert::TooFar => st.pkt_rcv_too_far += 1,
+            Insert::Belated => self.stats.pkt_rcv_belated += 1,
+            Insert::Duplicate => self.stats.pkt_rcv_duplicate += 1,
+            Insert::TooFar => self.stats.pkt_rcv_too_far += 1,
         }
         self.pkts_since_ack += 1;
         if self.pkts_since_ack >= LIGHT_ACK_PKTS && self.ack_due.is_none() && self.rcv.ack != self.last_ack_seq {
             self.ack_due = Some(AckKind::Light);
             self.pkts_since_ack = 0;
+        }
+    }
+
+    /// A packet entered the receive buffer (received, or rebuilt by FEC).
+    #[allow(clippy::too_many_arguments)]
+    fn on_stored(&mut self, now_us: i64, seq: u32, ts: u32, len: usize, rexmit: bool, rebuilt: bool, loss: Option<(u32, u32)>, filled_hole: bool) {
+        let st = &mut self.stats;
+        if !rebuilt {
+            st.pkt_recv_unique += 1;
+            st.byte_recv_unique += (len + PKT_OVERHEAD) as u64;
+            self.rate_pkts += 1;
+            self.rate_bytes += (len + PKT_OVERHEAD) as u64;
+            self.rcv_pkt_count += 1;
+        }
+        if let Some((a, b)) = loss {
+            self.on_loss(now_us, a, b, ts);
+        }
+        if filled_hole {
+            if let Some(f) = self.rcv_loss.fill(seq) {
+                self.stats.pkt_rcv_repaired += 1;
+                if rexmit && f.naks == 1 {
+                    self.nak_rtt_sample(now_us - f.last_nak_us);
+                }
+            }
+        }
+        if self.cfg.loss_max_ttl > 0 && self.rcv_loss.oldest_waiting().is_some() {
+            let w = self.cfg.reorder_window_us as i64;
+            self.rcv_loss.release_waiting(now_us, self.rcv_pkt_count, self.cfg.loss_max_ttl, w);
+        }
+    }
+
+    /// A FEC packet (spec 8.5, 8.6).
+    fn on_fec_packet(&mut self, now_us: i64, hdr: &DataHeader, payload: &[u8]) {
+        let Some(mut rx) = self.fec_rx.take() else { return };
+        let g = rx.on_fec(hdr.seq, payload, hdr.timestamp);
+        self.fec_rebuild(now_us, &mut rx);
+        if g.is_some() {
+            // the data packet it follows was sent: a loss at the tail of a
+            // burst is known now, not when the next burst comes
+            if let Some((a, b)) = self.rcv.note_sent_upto(hdr.seq) {
+                self.stats.pkt_rcv_fec_tail_loss += (seq_off(a, b) + 1) as u64;
+                let ts = self.last_data_ts;
+                self.on_loss(now_us, a, b, ts);
+            }
+        }
+        if let Some(g) = g {
+            let mut rel = std::mem::take(&mut self.fec_rel);
+            rel.clear();
+            rx.close(g, &self.rcv, &mut rel);
+            self.fec_release(now_us, &rx, &mut rel);
+            self.fec_rel = rel;
+        }
+        self.fec_rx = Some(rx);
+    }
+
+    /// Insert every packet the filter can rebuild (iteratively: a rebuilt
+    /// packet may complete its other group).
+    fn fec_rebuild(&mut self, now_us: i64, rx: &mut FecRx) {
+        while let Some(r) = rx.next_rebuild() {
+            if let Insert::Stored { loss, filled_hole } = self.rcv.insert(r.seq, rx.rebuilt(&r), r.timestamp, 1, false) {
+                self.stats.pkt_rcv_filter_supply += 1;
+                self.on_stored(now_us, r.seq, r.timestamp, r.len, false, true, loss, filled_hole);
+                rx.feed_rebuilt(&r);
+            }
+        }
+    }
+
+    /// The filter found these offsets unrebuildable: their first NAK is
+    /// due now (`arq:onreq`/`always`; nothing with `never`).
+    fn fec_release(&mut self, now_us: i64, rx: &FecRx, rel: &mut [i64]) {
+        if rel.is_empty() {
+            return;
+        }
+        rel.sort_unstable();
+        let mut i = 0;
+        while i < rel.len() {
+            let a = rel[i];
+            let mut b = a;
+            while i + 1 < rel.len() && rel[i + 1] <= b + 1 {
+                i += 1;
+                b = rel[i];
+            }
+            self.fec_release_range(now_us, rx.seq_of(a), rx.seq_of(b));
+            i += 1;
+        }
+    }
+
+    fn fec_release_range(&mut self, now_us: i64, first: u32, last: u32) {
+        if matches!(self.arq, Some(ArqLevel::OnReq) | Some(ArqLevel::Always)) {
+            self.stats.pkt_rcv_filter_loss += self.rcv_loss.release_range(first, last, now_us);
+        }
+    }
+
+    /// With FEC (`onreq`/`always`), how long a new loss waits for the filter
+    /// before its first NAK at most: half of what the latency leaves after
+    /// two NAK rounds, within [5 ms, latency / 4]; with `always` also at
+    /// most half an RTT (libsrt: `onreq` NAKs only what the filter reports,
+    /// up to two matrices late; `always` NAKs at once).
+    fn fec_nak_cap_us(&self) -> i64 {
+        if self.cfg.fec_nak_cap_us > 0 {
+            return self.cfg.fec_nak_cap_us as i64;
+        }
+        let lat = self.rcv_latency_ms as i64 * 1000;
+        let rt = self.renak_interval_us();
+        let cap = ((lat - 2 * rt) / 2).clamp(FEC_NAK_CAP_MIN_US, (lat / 4).max(FEC_NAK_CAP_MIN_US));
+        if self.arq == Some(ArqLevel::Always) {
+            cap.min((self.srtt as i64 / 2).max(2_000))
+        } else {
+            cap
         }
     }
 
@@ -837,12 +1025,19 @@ impl Connection {
             (Some(t), true) => t.due_us(ts),
             _ => NEVER,
         };
-        let wait = self.cfg.loss_max_ttl > 0 && self.peer_flags & flags::REXMITFLG != 0;
+        // with FEC the first NAK waits for the filter (or the cap); with
+        // arq:never there is none
+        let first_nak_us = match self.arq {
+            None => now_us,
+            Some(ArqLevel::Never) => NEVER,
+            Some(_) => now_us + self.fec_nak_cap_us(),
+        };
+        let wait = self.arq.is_none() && self.cfg.loss_max_ttl > 0 && self.peer_flags & flags::REXMITFLG != 0;
         self.rcv_loss.push(
             Hole {
                 first: a,
                 last: b,
-                next_nak_us: now_us,
+                next_nak_us: first_nak_us,
                 last_nak_us: now_us,
                 naks: 0,
                 detected_us: now_us,
@@ -952,7 +1147,7 @@ impl Connection {
     /// waiting for another NAK (the oldest hole is the closest to its
     /// deadline; a NAK crossing this is suppressed as a duplicate).
     fn ack_head_check(&mut self, now_us: i64, x: u32) {
-        if !self.rtt_known() || x == self.snd.next_send || !self.snd.holds_sent(x) {
+        if !self.sender_arq() || !self.rtt_known() || x == self.snd.next_send || !self.snd.holds_sent(x) {
             return;
         }
         let age = now_us - self.snd.last_tx_us(x);
@@ -1111,7 +1306,7 @@ impl Connection {
     /// When the tail probe is due (armed after new data, nothing unsent,
     /// the newest packets not acknowledged).
     fn probe_at_us(&self) -> Option<i64> {
-        if !self.cfg.tail_probe || !self.probe_armed || self.snd.unsent() > 0 || self.snd.in_flight() == 0 {
+        if !self.cfg.tail_probe || !self.sender_arq() || !self.probe_armed || self.snd.unsent() > 0 || self.snd.in_flight() == 0 {
             return None;
         }
         Some(self.last_data_tx_us + self.probe_delay_us())
@@ -1137,7 +1332,7 @@ impl Connection {
     /// has an RTT sample, then every max(RTT/2, 20 ms) with only one NAK
     /// per attempt), and does not depend on ACKs being repeated.
     fn head_probe_at_us(&self) -> Option<i64> {
-        if !self.cfg.tail_probe || self.snd.in_flight() == 0 || !self.rtt_known() {
+        if !self.cfg.tail_probe || !self.sender_arq() || self.snd.in_flight() == 0 || !self.rtt_known() {
             return None;
         }
         let una = self.snd.una;
@@ -1212,7 +1407,7 @@ impl Connection {
                 if self.snd.unsent() > 0 && self.window_open() {
                     t = t.min(self.pacer.next_ns() / 1000 + self.cfg.pace_quantum_us as i64);
                 }
-                if !self.snd_loss.is_empty() || self.rexmit_copy.is_some() {
+                if !self.snd_loss.is_empty() || self.rexmit_copy.is_some() || self.fec_tx.as_ref().map_or(false, |f| f.has_pending()) {
                     t = t.min(self.pacer.next_ns() / 1000);
                 }
                 t = t.min(self.rcv_loss.next_due());
@@ -1360,11 +1555,30 @@ impl Connection {
                 return Some(self.write_rexmit(seq, now_us, buf));
             }
         }
+        // FEC packets right after the data packet that completed their
+        // group, before the next new one (as libsrt: after retransmissions)
+        if let Some(tx) = self.fec_tx.as_mut() {
+            if tx.has_pending() {
+                if !self.pacer.ready(now_us * 1000) {
+                    return None;
+                }
+                let n = tx.write_next(self.peer_sid, buf)?;
+                let wire = n - HDR_LEN + PKT_OVERHEAD;
+                self.pacer.charge(wire);
+                self.stats.pkt_snd_filter_extra += 1;
+                self.stats.pkt_sent += 1;
+                self.stats.byte_sent += wire as u64;
+                return Some(n);
+            }
+        }
         if self.snd.unsent() > 0 && self.window_open() && self.pacer.ready(now_us * 1000) {
             let seq = self.snd.next_send;
             let p = self.snd.packet(seq)?;
             let n = p.len();
             buf[..n].copy_from_slice(p);
+            if let Some(tx) = self.fec_tx.as_mut() {
+                tx.on_new(seq, &buf[HDR_LEN..n], rd32(buf, 8), (buf[4] >> 3) & 3);
+            }
             self.snd.mark_sent(seq, now_us);
             self.snd.next_send = seq_inc(seq);
             self.last_data_tx_us = now_us;
@@ -1434,7 +1648,9 @@ impl Connection {
         } else {
             0
         };
-        let (seqs, late) = self.rcv_loss.collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, &mut out);
+        let (seqs, late) = self
+            .rcv_loss
+            .collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, &mut out);
         self.renak_sched_us = interval;
         let r = if out.is_empty() {
             None
@@ -1460,7 +1676,11 @@ impl Connection {
             kind,
             seq,
             rtt_us: self.srtt,
-            rtt_var_us: if self.cfg.ack_rttvar_floor { self.rttvar.max(self.srtt / 4 + 1) } else { self.rttvar },
+            rtt_var_us: if self.cfg.ack_rttvar_floor {
+                self.rttvar.max(self.srtt / 4 + 1)
+            } else {
+                self.rttvar
+            },
             avail_buf: self.rcv.available(),
             pkt_rate: 0,
             bandwidth: 0,

@@ -169,6 +169,26 @@ impl RcvBuf {
         })
     }
 
+    /// `seq` is in the window (not delivered or dropped, not beyond the
+    /// highest received) and absent.
+    #[inline]
+    pub fn is_missing(&self, seq: u32) -> bool {
+        seq_le(self.base, seq) && seq_le(seq, self.highest) && !self.present(seq)
+    }
+
+    /// The peer has sent up to `seq` (a FEC packet carries the sequence of
+    /// the data packet before it): the gap after the highest received, if
+    /// any, becomes known. Returns it (first, last).
+    pub fn note_sent_upto(&mut self, seq: u32) -> Option<(u32, u32)> {
+        let h = seq_off(self.highest, seq);
+        if h <= 0 || seq_off(self.base, seq) as u32 >= self.cap {
+            return None;
+        }
+        let gap = (seq_inc(self.highest), seq);
+        self.highest = seq;
+        Some(gap)
+    }
+
     /// First present packet after a missing head.
     pub fn first_present(&self) -> Option<HeadInfo> {
         if self.count == 0 {
