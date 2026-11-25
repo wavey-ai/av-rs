@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 const STEP: Duration = Duration::from_micros(50);
 
 type DropFn = Box<dyn FnMut(&str, &[u8]) -> bool>;
+type DelayFn = Box<dyn FnMut(&str, &[u8]) -> Duration>;
 
 struct Sim {
     t0: Instant,
@@ -23,6 +24,7 @@ struct Sim {
     accepted: Vec<u32>,
     wire: Vec<(Instant, SocketAddr, Vec<u8>)>,
     drop: DropFn,
+    delay: DelayFn,
     sent_a: Vec<Vec<u8>>,
     sent_b: Vec<Vec<u8>>,
 }
@@ -44,6 +46,7 @@ impl Sim {
             accepted: Vec::new(),
             wire: Vec::new(),
             drop: Box::new(|_, _| false),
+            delay: Box::new(|_, _| Duration::ZERO),
             sent_a: Vec::new(),
             sent_b: Vec::new(),
         }
@@ -102,7 +105,8 @@ impl Sim {
             let d = buf[..t.len].to_vec();
             self.sent_a.push(d.clone());
             if !(self.drop)("a", &d) {
-                self.wire.push((now + self.owd, self.b, d));
+                let extra = (self.delay)("a", &d);
+                self.wire.push((now + self.owd + extra, self.b, d));
             }
         }
         for c in self.conns.values_mut() {
@@ -110,7 +114,8 @@ impl Sim {
                 let d = buf[..t.len].to_vec();
                 self.sent_b.push(d.clone());
                 if !(self.drop)("b", &d) {
-                    self.wire.push((now + self.owd, self.a, d));
+                    let extra = (self.delay)("b", &d);
+                    self.wire.push((now + self.owd + extra, self.a, d));
                 }
             }
         }
@@ -220,18 +225,19 @@ fn tsbpd_delivers_at_origin_plus_owd_plus_latency_in_order() {
     assert_eq!(s.caller.stats().ack_invalid, 0);
 }
 
+fn data_seq(d: &[u8]) -> Option<u32> {
+    match packet::decode(d).ok()? {
+        Packet::Data { hdr, .. } => Some(hdr.seq),
+        _ => None,
+    }
+}
+
 #[test]
 fn gap_is_dropped_when_next_packet_is_due() {
     let mut s = Sim::new(cfg(100), cfg(100), 5, 7);
     s.connect();
-    let mut n = 0;
-    s.drop = Box::new(move |side, d| {
-        if side == "a" && d[0] & 0x80 == 0 {
-            n += 1;
-            return n == 3; // lose the third data packet
-        }
-        false
-    });
+    // lose the third data packet and every retransmission of it
+    s.drop = Box::new(move |side, d| side == "a" && data_seq(d) == Some(9));
     for i in 0..5u8 {
         s.caller.send_message(s.now, &[i; 100], None).unwrap();
     }
@@ -247,6 +253,11 @@ fn gap_is_dropped_when_next_packet_is_due() {
     let st = s.conn().stats().clone();
     assert_eq!(st.pkt_rcv_loss, 1);
     assert_eq!(st.pkt_rcv_drop, 1);
+    // it was NAKed and retransmitted (every copy lost), then given up
+    assert!(st.pkt_sent_nak >= 2, "{st:?}");
+    assert!(s.caller.stats().pkt_retrans >= 2);
+    let now = s.now;
+    assert_eq!(s.conn().snapshot(now).rcv_loss_seqs, 0, "dropped holes leave the loss list");
 }
 
 #[test]
@@ -378,4 +389,322 @@ fn send_buffer_full_and_too_large() {
     s.run_until(Duration::from_millis(100), |_| false);
     assert_eq!(s.caller.send_buffer_len(), 0);
     assert!(s.caller.send_message(s.now, &[0; 10], None).is_ok());
+}
+
+/// Deterministic xorshift PRNG for loss patterns.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn chance(&mut self, pct: f64) -> bool {
+        (self.next() % 1_000_000) as f64 / 10_000.0 < pct
+    }
+}
+
+/// Send `frames` bursts of `per_frame` packets every `interval` from the
+/// caller; return (frame index, packets delivered late or not at all,
+/// latency of each delivered packet).
+fn run_frames(s: &mut Sim, frames: usize, per_frame: usize, interval: Duration, tail: Duration) -> (Vec<Duration>, usize) {
+    let mut sent_at: Vec<Instant> = Vec::new();
+    let mut lat = Vec::new();
+    let mut msg = vec![0u8; 1316];
+    let start = s.now;
+    let mut next_frame = start;
+    let mut sent_frames = 0;
+    let mut got = std::collections::HashSet::new();
+    s.run_until(interval * frames as u32 + tail, |s| {
+        if sent_frames < frames && s.now >= next_frame {
+            for _ in 0..per_frame {
+                let i = sent_at.len() as u32;
+                msg[..4].copy_from_slice(&i.to_be_bytes());
+                s.caller.send_message(s.now, &msg, None).unwrap();
+                sent_at.push(s.now);
+            }
+            sent_frames += 1;
+            next_frame += interval;
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            let i = u32::from_be_bytes(m.payload[..4].try_into().unwrap());
+            assert!(got.insert(i), "delivered twice: {i}");
+            lat.push(now - sent_at[i as usize]);
+        }
+        false
+    });
+    let missing = sent_at.len() - got.len();
+    (lat, missing)
+}
+
+#[test]
+fn single_loss_is_nak_repaired_and_delivered_on_time() {
+    let mut s = Sim::new(cfg(120), cfg(120), 15, 100);
+    s.connect();
+    let mut lost = false;
+    // lose the first transmission of seq 102 (the third packet)
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(102) && !lost {
+            lost = true;
+            return true;
+        }
+        false
+    });
+    let (lat, missing) = run_frames(&mut s, 1, 5, Duration::from_millis(40), Duration::from_millis(400));
+    assert_eq!(missing, 0);
+    // every packet, the repaired one included, at origin + 15 ms + 120 ms:
+    // the repair fills the head gap and wakes delivery at once (not one
+    // frame later, spec 6.10)
+    for l in &lat {
+        assert!(*l >= Duration::from_micros(134_900) && *l <= Duration::from_micros(135_200), "{lat:?}");
+    }
+    let r = s.conn().stats().clone();
+    assert_eq!((r.pkt_rcv_loss, r.pkt_rcv_drop, r.pkt_rcv_retrans, r.pkt_rcv_repaired), (1, 0, 1, 1));
+    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (2, 1), "one immediate NAK, sent twice");
+    let c = s.caller.stats().clone();
+    // both copies arrive; the second finds the request already queued
+    assert_eq!((c.pkt_retrans, c.pkt_snd_loss, c.pkt_recv_nak), (1, 2, 2));
+    assert_eq!(c.pkt_sent, 6);
+}
+
+#[test]
+fn lost_retransmission_and_lost_nak_are_renaked() {
+    // 1002 and 1004 lost; the first NAK (both copies) lost; then the first
+    // retransmission of 1002 lost: three NAK rounds, the last repair of 1002
+    // sent twice (its second retransmission)
+    let mut s = Sim::new(cfg(200), cfg(200), 15, 1000);
+    s.connect();
+    s.run_until(Duration::from_millis(200), |_| false); // RTT known
+    let (mut n1002, mut n1004, mut naks) = (0, 0, 0);
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(1002) {
+            n1002 += 1;
+            return n1002 <= 2;
+        }
+        if side == "a" && data_seq(d) == Some(1004) {
+            n1004 += 1;
+            return n1004 == 1;
+        }
+        if side == "b" && ctl_type(d) == Some(packet::ctrl::NAK) {
+            naks += 1;
+            return naks <= 2;
+        }
+        false
+    });
+    let (lat, missing) = run_frames(&mut s, 1, 8, Duration::from_millis(40), Duration::from_millis(600));
+    assert_eq!(missing, 0, "{:?}", s.conn().stats());
+    for l in &lat {
+        assert!(*l >= Duration::from_micros(214_900) && *l <= Duration::from_micros(215_200), "{lat:?}");
+    }
+    let r = s.conn().stats().clone();
+    assert_eq!(r.pkt_rcv_drop, 0);
+    assert_eq!(r.pkt_sent_nak, 6, "three rounds, each sent twice");
+    assert_eq!(r.nak_seqs_sent, 2 + 2 + 1);
+    let c = s.caller.stats().clone();
+    // 1004 once, 1002 three times (the third doubled, as a second
+    // repair), and a tail probe of 1007 while the ACK was held at 1002
+    assert!(c.pkt_tail_probe <= 1);
+    assert_eq!(c.pkt_retrans, 1 + 3 + c.pkt_tail_probe, "{c:?}");
+    assert_eq!(r.pkt_rcv_duplicate, 1 + c.pkt_tail_probe);
+    // one re-NAK interval is about one RTT (30 ms) + capped variation +
+    // 2 ms, far below libsrt's 300 ms before its first periodic NAK
+    let now = s.now;
+    let sn = s.conn().snapshot(now);
+    assert!(sn.renak_interval_us < 50_000, "{}", sn.renak_interval_us);
+}
+
+#[test]
+fn tail_probe_recovers_a_lost_last_packet() {
+    let mut s = Sim::new(cfg(120), cfg(120), 15, 500);
+    s.connect();
+    let mut lost = false;
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(509) && !lost {
+            lost = true;
+            return true; // the last packet of the only burst
+        }
+        false
+    });
+    let (lat, missing) = run_frames(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(400));
+    assert_eq!(missing, 0);
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_200)), "{lat:?}");
+    let c = s.caller.stats().clone();
+    assert_eq!(c.pkt_tail_probe, 1);
+    // the probe, plus a second copy if too little time was left for
+    // another round
+    assert_eq!(c.pkt_retrans, 1 + c.pkt_rexmit_copies, "{c:?}");
+    assert_eq!(s.conn().stats().pkt_rcv_drop, 0);
+}
+
+#[test]
+fn no_tail_probe_when_acknowledged() {
+    let mut s = Sim::new(cfg(120), cfg(120), 15, 500);
+    s.connect();
+    let (_, missing) = run_frames(&mut s, 5, 10, Duration::from_millis(100), Duration::from_millis(400));
+    assert_eq!(missing, 0);
+    let c = s.caller.stats().clone();
+    assert_eq!((c.pkt_tail_probe, c.pkt_retrans), (0, 0), "{c:?}");
+}
+
+#[test]
+fn random_loss_5pct_both_ways_rtt30_l120() {
+    // 5 % random loss on every datagram (data, NAK, ACK, retransmission) in
+    // both directions; 24 frames/s of 100 packets; latency 4 x RTT
+    let mut s = Sim::new(cfg(120), cfg(120), 15, 77);
+    s.connect();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    s.drop = Box::new(move |_, _| rng.chance(5.0));
+    let (lat, missing) = run_frames(&mut s, 48, 100, Duration::from_micros(41_667), Duration::from_millis(500));
+    let r = s.conn().stats().clone();
+    let c = s.caller.stats().clone();
+    assert_eq!(missing, 0, "rcv {r:?}\nsnd {c:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_300)));
+    assert!(r.pkt_rcv_loss > 150, "{}", r.pkt_rcv_loss);
+    // retransmissions close to the losses (losses of retransmissions and
+    // tail probes add a few); duplicates few
+    assert!(c.pkt_retrans < r.pkt_rcv_loss * 14 / 10, "retrans {} loss {}", c.pkt_retrans, r.pkt_rcv_loss);
+    // duplicates: mostly the deliberate second copies of late repairs
+    assert!(r.pkt_rcv_duplicate <= c.pkt_rexmit_copies + r.pkt_rcv_loss / 20, "dup {} loss {}\n{c:?}", r.pkt_rcv_duplicate, r.pkt_rcv_loss);
+    assert!(c.pkt_rexmit_copies < r.pkt_rcv_loss / 4, "{c:?}");
+    assert_eq!((c.ack_invalid, c.nak_invalid), (0, 0));
+}
+
+#[test]
+fn random_loss_5pct_rtt250_l1000_listener_sends() {
+    // the other direction (listener -> caller) on a long path
+    let mut s = Sim::new(cfg(1000), cfg(1000), 125, 3);
+    s.connect();
+    let mut rng = Rng(12345);
+    s.drop = Box::new(move |_, _| rng.chance(5.0));
+    let mut sent = 0u32;
+    let mut got = Vec::new();
+    let start = s.now;
+    s.run_until(Duration::from_millis(2800), |s| {
+        if s.now - start < Duration::from_millis(1500) && (s.now - start).as_micros() % 10_000 < 50 {
+            for _ in 0..20 {
+                let now = s.now;
+                s.conn().send_message(now, &sent.to_be_bytes(), None).unwrap();
+                sent += 1;
+            }
+        }
+        while let Some(m) = s.caller.recv_message(s.now) {
+            got.push(u32::from_be_bytes(m.payload.try_into().unwrap()));
+        }
+        false
+    });
+    let missing: Vec<u32> = (0..sent).filter(|i| !got.contains(i)).collect();
+    let snd = s.conn().stats().clone();
+    assert_eq!(got.len() as u32, sent, "missing {missing:?}\nrcv {:?}\nsnd {snd:?}", s.caller.stats());
+    assert_eq!(got, (0..sent).collect::<Vec<_>>());
+    assert_eq!(s.caller.stats().pkt_rcv_drop, 0);
+}
+
+#[test]
+fn sender_drop_announces_dropreq() {
+    let mut s = Sim::new(cfg(100), cfg(100), 5, 50);
+    s.connect();
+    s.run_until(Duration::from_millis(100), |_| false); // RTT known
+    // every data packet and every ACK lost: the sender holds the packets
+    // latency + max(latency/4, 20 ms) (+ RTT/2, unknown here: no ACK) =
+    // 125 ms past their origin,
+    // then drops them and says so
+    s.drop = Box::new(|side, d| (side == "a" && data_seq(d).is_some()) || (side == "b" && ctl_type(d) == Some(packet::ctrl::ACK)));
+    let t = s.now;
+    for i in 0..6u8 {
+        s.caller.send_message(s.now, &[i; 10], None).unwrap();
+    }
+    assert!(s.run_until(Duration::from_millis(300), |s| s.caller.send_buffer_len() == 0));
+    let e = s.now - t;
+    assert!(e >= Duration::from_millis(125) && e < Duration::from_millis(127), "{e:?}");
+    let c = s.caller.stats().clone();
+    assert_eq!(c.pkt_snd_drop, 6, "{c:?}");
+    assert_eq!(c.pkt_sent_dropreq, 1);
+    s.run_until(Duration::from_millis(20), |_| false);
+    assert_eq!(s.conn().stats().pkt_recv_dropreq, 1);
+}
+
+#[test]
+fn nak_for_unheld_sequence_gets_dropreq_and_dropreq_clears_holes() {
+    let mut s = Sim::new(cfg(500), cfg(500), 5, 50);
+    s.connect();
+    // 51..=54 never arrive
+    s.drop = Box::new(|side, d| side == "a" && matches!(data_seq(d), Some(51..=54)));
+    for i in 0..6u8 {
+        s.caller.send_message(s.now, &[i; 10], None).unwrap();
+    }
+    s.run_until(Duration::from_millis(60), |_| false);
+    let now = s.now;
+    assert_eq!(s.conn().snapshot(now).rcv_loss_seqs, 4);
+    // the sender says it will not send 52..=53
+    let mut b = [0u8; 64];
+    let sid = s.conn().local_socket_id();
+    let n = packet::encode_dropreq(0, 52, 53, 0, sid, &mut b);
+    let a = s.a;
+    s.conn().handle_datagram(now, a, &b[..n]);
+    assert_eq!(s.conn().snapshot(now).rcv_loss_seqs, 2);
+    assert_eq!(s.conn().stats().pkt_rcv_dropreq_seqs, 2);
+    // a NAK for 50 (already acknowledged) is answered with a DROPREQ
+    s.run_until(Duration::from_millis(30), |_| false);
+    assert!(s.caller.send_buffer_len() < 6);
+    let before = s.caller.stats().pkt_sent_dropreq;
+    let n = packet::encode_nak([(50, 50)], 0, 0x1234, 10, &mut b);
+    let (now, bb) = (s.now, s.b);
+    s.caller.handle_datagram(now, bb, &b[..n]);
+    let mut out = [0u8; 1500];
+    let mut seen = None;
+    while let Some(t) = s.caller.poll_transmit(now, &mut out) {
+        if let Ok(Packet::Control {
+            hdr,
+            body: Control::DropReq { first, last },
+        }) = packet::decode(&out[..t.len])
+        {
+            seen = Some((hdr.info, first, last));
+        }
+    }
+    assert_eq!(seen, Some((0, 50, 50)));
+    assert_eq!(s.caller.stats().pkt_sent_dropreq, before + 1);
+    // a NAK beyond what was sent is ignored and counted
+    let n = packet::encode_nak([(60, 61)], 0, 0x1234, 10, &mut b);
+    s.caller.handle_datagram(now, bb, &b[..n]);
+    assert_eq!(s.caller.stats().nak_invalid, 1);
+    assert!(s.caller.is_connected());
+}
+
+#[test]
+fn reorder_tolerance_suppresses_nak_for_late_packet() {
+    let ccfg = cfg(120);
+    let lcfg = Config { loss_max_ttl: 10, ..cfg(120) };
+    let mut s = Sim::new(ccfg, lcfg, 10, 900);
+    s.connect();
+    // seq 902 arrives 300 us late (after the other 7 of its burst: fewer
+    // than 10 packets and well within the 2 ms reorder window)
+    s.delay = Box::new(|side, d| if side == "a" && data_seq(d) == Some(902) { Duration::from_micros(300) } else { Duration::ZERO });
+    let (_, missing) = run_frames(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(300));
+    assert_eq!(missing, 0);
+    let r = s.conn().stats().clone();
+    assert_eq!(r.pkt_rcv_loss, 1, "seen as a gap");
+    assert_eq!(r.pkt_sent_nak, 0, "but not NAKed: it arrived within the tolerance");
+    assert_eq!(s.caller.stats().pkt_retrans, 0);
+}
+
+#[test]
+fn reorder_beyond_tolerance_is_naked() {
+    let lcfg = Config { loss_max_ttl: 4, ..cfg(120) };
+    let mut s = Sim::new(cfg(120), lcfg, 10, 900);
+    s.connect();
+    let mut lost = false;
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(902) && !lost {
+            lost = true;
+            return true;
+        }
+        false
+    });
+    let (_, missing) = run_frames(&mut s, 1, 10, Duration::from_millis(40), Duration::from_millis(300));
+    assert_eq!(missing, 0);
+    let r = s.conn().stats().clone();
+    assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (2, 1));
+    assert_eq!(s.caller.stats().pkt_retrans, 1);
 }

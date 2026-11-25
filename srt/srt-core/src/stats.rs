@@ -32,6 +32,19 @@ pub struct Stats {
     pub nak_invalid: u64,
     /// Messages refused because the send buffer was full.
     pub send_would_block: u64,
+    /// NAKed sequences not retransmitted because they had been (re)sent
+    /// less than about one RTT before (the request crossed the repair).
+    pub pkt_rexmit_suppressed: u64,
+    /// Tail probes sent (newest packet retransmitted after a quiet RTT).
+    pub pkt_tail_probe: u64,
+    /// Retransmissions queued because an ACK still stopped at a packet
+    /// sent more than an RTT before (its last copy was lost).
+    pub pkt_ack_rexmit: u64,
+    /// Extra copies sent of late repairs (second retransmission on, or too
+    /// close to the deadline for another round).
+    pub pkt_rexmit_copies: u64,
+    /// DROPREQ packets sent (sequences we no longer hold).
+    pub pkt_sent_dropreq: u64,
 
     // ---- receiver
     /// Data packets received incl. duplicates and FEC (pktRecvTotal).
@@ -61,6 +74,12 @@ pub struct Stats {
     pub pkt_sent_ack: u64,
     pub pkt_sent_light_ack: u64,
     pub pkt_sent_nak: u64,
+    /// Sequences listed in the NAKs we sent (counting repeats).
+    pub nak_seqs_sent: u64,
+    /// Lost sequences that arrived later (repaired or reordered).
+    pub pkt_rcv_repaired: u64,
+    /// Lost sequences the sender told us (DROPREQ) it will not send.
+    pub pkt_rcv_dropreq_seqs: u64,
     pub pkt_recv_ackack: u64,
     /// Messages handed to the application.
     pub msg_delivered: u64,
@@ -109,6 +128,14 @@ pub struct Snapshot {
     /// Pacing rate, bytes/s (mbpsMaxBW x 1e6 / 8).
     pub pacing_bytes_per_s: f64,
     pub drift_us: i64,
+    /// Receiver: smoothed time from a NAK to the repair arriving, us (0
+    /// until measured), and the re-NAK interval in use.
+    pub nak_rtt_us: u32,
+    pub renak_interval_us: u32,
+    /// Receiver loss list: runs and sequences; sender loss list runs.
+    pub rcv_loss_runs: u32,
+    pub rcv_loss_seqs: u64,
+    pub snd_loss_runs: u32,
     pub snd_slots_allocated: u32,
     pub rcv_slots_allocated: u32,
     pub peer_srt_version: u32,

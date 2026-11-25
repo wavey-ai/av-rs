@@ -45,8 +45,24 @@ pub struct Config {
     pub snd_drop_delay_ms: i32,
     /// [SRTO_DRIFTTRACER]
     pub drift_tracer: bool,
-    /// [SRTO_LOSSMAXTTL]; recorded, used by loss recovery (later stage).
+    /// [SRTO_LOSSMAXTTL]: reorder tolerance in packets before a gap is
+    /// NAKed (0 = NAK at once). Ours is also bounded in time by
+    /// `reorder_window_us`.
     pub loss_max_ttl: u32,
+    /// With `loss_max_ttl` > 0, NAK a gap after at most this long even if
+    /// fewer packets arrived (spec 12 #14). Not an SRT option.
+    pub reorder_window_us: u32,
+    /// Sender tail probe (spec 12 #5): when the newest packets stay
+    /// unacknowledged for SRTT + 4 RTTVar + one ACK period and nothing newer
+    /// is queued, retransmit the newest one so a lost tail is seen at once.
+    /// Not an SRT option.
+    pub tail_probe: bool,
+    /// Send every NAK twice, and a packet twice from its second
+    /// retransmission on: a repair attempt then fails only if both copies
+    /// are lost, so fewer RTTs of latency carry the same loss. Costs one
+    /// small control packet per NAK and a copy for ~loss% of repairs. Not
+    /// an SRT option; wire-compatible (libsrt drops duplicates).
+    pub repair_copies: bool,
     /// When the pacer holds packets back, wake this long after the next
     /// packet is allowed, so each wake-up sends a batch (the pacer's 1 ms
     /// burst allowance keeps the rate). Not an SRT option.
@@ -76,6 +92,9 @@ impl Default for Config {
             snd_drop_delay_ms: 0,
             drift_tracer: true,
             loss_max_ttl: 0,
+            reorder_window_us: 2000,
+            tail_probe: true,
+            repair_copies: true,
             pace_quantum_us: 250,
         }
     }

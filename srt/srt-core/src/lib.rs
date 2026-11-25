@@ -1,16 +1,20 @@
 //! Sans-IO SRT (Secure Reliable Transport) live mode, interoperable with
-//! libsrt 1.5.7: HSv5 caller and listener, TSBPD delivery, ACK/ACKACK, keepalive,
+//! libsrt 1.5.7: HSv5 caller and listener, TSBPD delivery, ACK/ACKACK, NAK and
+//! retransmission, keepalive,
 //! shutdown, peer idle timeout. No sockets, threads or clock reads: every
 //! entry point takes `now`. See DESIGN.md.
 //!
-//! Loss recovery (NAK/retransmission) and the FEC packet filter are later
-//! stages; packet-filter configs are already negotiated and carried.
+//! Loss recovery: receiver loss list with a NAK schedule per hole, sender
+//! retransmission ahead of new data, DROPREQ, sender drop and a tail probe
+//! (spec 6, 7, 12). The FEC packet filter is a later stage; packet-filter
+//! configs are already negotiated and carried.
 
 pub mod config;
 pub mod conn;
 pub mod filter;
 pub mod handshake;
 pub mod listener;
+mod losslist;
 pub mod packet;
 mod pool;
 mod rcvbuf;

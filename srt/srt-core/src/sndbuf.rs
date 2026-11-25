@@ -11,12 +11,18 @@ struct Slot {
     len: u16,
     /// Origin time, us on the local clock.
     origin_us: i64,
+    /// Last (re)transmission, us on the local clock (`i64::MIN`: not sent).
+    last_tx_us: i64,
+    /// Retransmissions so far.
+    rexmits: u16,
 }
 
 const EMPTY: Slot = Slot {
     idx: NONE,
     len: 0,
     origin_us: 0,
+    last_tx_us: i64::MIN,
+    rexmits: 0,
 };
 
 pub(crate) struct SndBuf {
@@ -100,6 +106,8 @@ impl SndBuf {
             idx,
             len: payload.len() as u16,
             origin_us,
+            last_tx_us: i64::MIN,
+            rexmits: 0,
         };
         self.next_seq = seq_inc(seq);
         self.next_msgno = msgno_inc(msgno);
@@ -113,6 +121,39 @@ impl SndBuf {
             return None;
         }
         Some(&self.pool.get(s.idx)[..HDR_LEN + s.len as usize])
+    }
+
+    /// Record a (re)transmission of a held sequence.
+    #[inline]
+    pub fn mark_sent(&mut self, seq: u32, now_us: i64) {
+        self.slots[(seq & self.mask) as usize].last_tx_us = now_us;
+    }
+
+    /// Count one retransmission of a held sequence; returns the new count.
+    #[inline]
+    pub fn count_rexmit(&mut self, seq: u32) -> u16 {
+        let s = &mut self.slots[(seq & self.mask) as usize];
+        s.rexmits = s.rexmits.saturating_add(1);
+        s.rexmits
+    }
+
+    /// Origin time of a held sequence.
+    #[inline]
+    pub fn origin_us(&self, seq: u32) -> i64 {
+        self.slots[(seq & self.mask) as usize].origin_us
+    }
+
+    /// Last (re)transmission time of a held sequence.
+    #[inline]
+    pub fn last_tx_us(&self, seq: u32) -> i64 {
+        self.slots[(seq & self.mask) as usize].last_tx_us
+    }
+
+    /// Whether `seq` is held and was sent at least once.
+    #[inline]
+    pub fn holds_sent(&self, seq: u32) -> bool {
+        let o = seq_off(self.una, seq);
+        o >= 0 && o < seq_off(self.una, self.next_send)
     }
 
     pub fn holds(&self, seq: u32) -> bool {
@@ -148,7 +189,8 @@ impl SndBuf {
     }
 
     /// Drop every held packet with origin before `threshold_us` (spec 7.6);
-    /// returns (packets, payload bytes, packets that were never sent).
+    /// returns (packets, payload bytes, packets that were never sent). The
+    /// dropped sequences are `old una ..` the new `una`.
     pub fn drop_older_than(&mut self, threshold_us: i64) -> (u32, u64, u32) {
         let (mut n, mut bytes, mut unsent) = (0u32, 0u64, 0u32);
         while self.len() > 0 && self.slots[(self.una & self.mask) as usize].origin_us < threshold_us {
