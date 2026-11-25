@@ -218,6 +218,40 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
 - `pktRcvLossTotal` counts gaps in the arrival sequence before any
   rebuild, as libsrt does (comparable with and without FEC).
 
+## Robustness (stage 3 review)
+
+- Gap beyond the receive buffer: when a packet lands at or past
+  `base + capacity` and the buffer holds nothing (TSBPD + TLPKTDROP), the
+  window restarts half a buffer before it (`RcvBuf::resync`): what came
+  before is counted as dropped, the half buffer before it is an ordinary
+  loss (NAKed; a sender that no longer holds it answers with DROPREQ).
+  libsrt breaks the connection there ("sequence discrepancy", spec 6.2
+  step 3). `pktRcvResync`.
+- DROPREQ: besides clearing the loss list, a range that covers the head
+  moves the delivery point and the ACK over the absent packets (up to the
+  first present one); a range beyond the highest received moves `highest`
+  (within the window), so the next packet does not report it as a loss.
+- Flow window: after a full/small ACK advertised less than a quarter of
+  the buffer, a full ACK goes out on the next ACK tick as soon as the room
+  grows, and every SRTT + 4 RTTVar while it stays small (libsrt:
+  `m_bBufferWasFull`). Without it a sender whose window closed during a
+  reader stall never learns that it reopened (it sends nothing, so the ACK
+  value never changes). `pktSentWindowAck`.
+- Data with KK != 0 is counted (`pktRcvUndecrypt`) and dropped; it does
+  not close the connection (as libsrt).
+- Sender, with FEC: stall probe. When the oldest unacknowledged packet,
+  never retransmitted, is still unacknowledged the ACK-head threshold
+  (SRTT + 2 RTTVar + 1 ms + `fec_ack_head_delay_us`, auto
+  max(latency/4, 10 ms)) plus one ACK period after it was sent, it is sent
+  again: a libsrt `onreq` receiver never reports a loss in the last,
+  unfinished group, nor those its filter forgets on a reset, and repeats a
+  stuck ACK only until it is ACKACKed. `pktStallProbe`.
+- Sender: a retransmission (NAK, ACK-head, probe) that would reach the
+  receiver after the packet's play time (now > origin + latency: it plays
+  at origin + latency + one-way delay and the copy arrives at now + one-way
+  delay) is skipped (`pktRexmitTooLate`); a probe of such a head is given
+  up rather than retried.
+
 ## srt-mio
 
 - `SrtSocket::connect(local, remote, cfg)`: non-blocking; the handshake
