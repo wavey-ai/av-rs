@@ -505,7 +505,7 @@ fn lost_retransmission_and_lost_nak_are_renaked() {
     // whichever comes first (the other is suppressed or not needed)
     assert!(r.pkt_sent_nak >= 4 && r.pkt_sent_nak % 2 == 0, "{r:?}");
     let c = s.caller.stats().clone();
-    assert!(c.pkt_retrans >= 1 + 2 && c.pkt_retrans <= 1 + 3 + c.pkt_tail_probe + c.pkt_head_probe, "{c:?}");
+    assert!(c.pkt_retrans >= 3 && c.pkt_retrans <= 1 + 3 + c.pkt_tail_probe + c.pkt_head_probe, "{c:?}");
     // one re-NAK interval is about one RTT (30 ms) + capped variation +
     // 2 ms, far below libsrt's 300 ms before its first periodic NAK
     let now = s.now;
