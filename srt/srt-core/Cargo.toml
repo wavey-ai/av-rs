@@ -1,0 +1,10 @@
+[package]
+name = "srt-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+description = "Sans-IO SRT (Secure Reliable Transport) live-mode protocol engine, interoperable with libsrt 1.5.7"
+repository = "https://github.com/wavey-ai/av-rs"
+
+[dependencies]
