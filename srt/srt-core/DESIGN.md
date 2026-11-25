@@ -86,6 +86,14 @@ copied once into the I/O batch buffer.
 - Timers: `poll_timeout()` from the core arms a `timerfd` (`SrtTimer`, a mio
   source) so TSBPD delivery and pacing wake within tens of microseconds
   instead of epoll's 1 ms.
+- Readiness: sockets are registered READABLE only (a UDP socket raises an
+  EPOLLOUT edge for every packet the kernel frees, so WRITABLE interest
+  means a wake-up per packet sent); `drive_io` skips `recvmmsg` unless the
+  socket fired since it was last drained. Measured at 2160p160 over netns:
+  2.4 -> 17.5 datagrams per `sendmmsg`, sender CPU 0.077 -> 0.041 cores.
+- Pacing wakes `pace_quantum_us` (250 us) after the next packet is allowed,
+  so each wake-up sends a batch; the pacer's 1 ms burst allowance keeps the
+  configured rate.
 
 ## Interop rules kept in mind (spec)
 

@@ -4,9 +4,13 @@
 //! and a `timerfd` source (`SrtTimer`) for sub-millisecond wake-ups.
 //!
 //! Everything runs on the caller's thread: register the socket (and a
-//! timer) in a `mio::Poll`, call `drive(now)` when it is readable/writable
-//! or the timer fires, arm the timer at `poll_timeout()`, and read messages
-//! with `recv_with`. See srt-core's DESIGN.md.
+//! timer) in a `mio::Poll` with `Interest::READABLE` only, call
+//! `set_readable()` when its token fires and `drive_io(now)` on every
+//! wake-up, arm the timer at `poll_timeout()`, and read messages with
+//! `recv_with`. Do not register WRITABLE: on UDP every packet the kernel
+//! frees raises a new EPOLLOUT edge, i.e. one wake-up per packet sent; if
+//! `pending_datagrams() > 0` (EAGAIN) retry on a short timer instead.
+//! See srt-core's DESIGN.md.
 
 pub mod batch;
 mod listener;
