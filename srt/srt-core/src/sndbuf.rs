@@ -307,6 +307,26 @@ mod tests {
     }
 
     #[test]
+    fn pacer_input_rate_mode() {
+        // MAXBW 0, INPUTBW 0: measured input x (1 + OHEADBW); first window 500 ms
+        let mut p = Pacer::new(None, 25, 0.0, 0);
+        assert_eq!(p.rate(), crate::config::BW_INFINITE as f64);
+        let mut t = 0i64;
+        // 1000 x 956 B payload (+44) per 500 ms = 2 MB/s
+        for _ in 0..1001 {
+            p.on_input(956, t);
+            t += 500_000;
+        }
+        assert!((p.rate() - 2_500_000.0).abs() < 10_000.0, "{}", p.rate());
+        // explicit INPUTBW via Config: 1 MB/s x 1.25
+        let c = crate::Config { max_bw: 0, input_bw: 1_000_000, ..crate::Config::default() };
+        assert_eq!(c.fixed_pacing_rate(), Some(1_250_000.0));
+        let c = crate::Config { max_bw: 3_000_000, ..crate::Config::default() };
+        assert_eq!(c.fixed_pacing_rate(), Some(3_000_000.0));
+        assert_eq!(crate::Config::default().fixed_pacing_rate(), Some(125_000_000.0));
+    }
+
+    #[test]
     fn pacer_rate_and_burst() {
         let mut p = Pacer::new(Some(1_000_000.0), 25, 0.0, 0); // 1 MB/s
         let mut now = 10_000_000i64;
