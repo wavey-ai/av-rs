@@ -1492,3 +1492,73 @@ fn lost_tail_is_still_repaired_with_a_slow_acking_peer() {
     assert_eq!(r.pkt_rcv_drop, 0);
     assert!(lat.iter().all(|l| *l <= Duration::from_micros(121_500)), "{:?}", lat.iter().max());
 }
+
+/// Frames lost (any packet missing or later than `deadline`) for `frames`
+/// bursts of `per` packets every 41.667 ms, random loss `pct` both ways.
+fn weak_case(ccfg: Config, lcfg: Config, owd_us: u64, pct: f64, per: usize, frames: usize, seed: u64, deadline: Duration) -> (usize, srt_core::Stats, srt_core::Stats) {
+    let mut s = Sim::new(ccfg, lcfg, 0, 9);
+    s.owd = Duration::from_micros(owd_us);
+    s.connect();
+    let mut rng = Rng(seed);
+    s.drop = Box::new(move |_, _| rng.chance(pct));
+    let mut sent_at: Vec<Instant> = Vec::new();
+    let mut ok = std::collections::HashSet::new();
+    let interval = Duration::from_micros(41_667);
+    let mut next = s.now;
+    let mut nf = 0;
+    s.run_until(interval * frames as u32 + Duration::from_millis(1500), |s| {
+        if nf < frames && s.now >= next {
+            for _ in 0..per {
+                let i = sent_at.len() as u32;
+                s.caller.send_message(s.now, &vmsg(i), None).unwrap();
+                sent_at.push(s.now);
+            }
+            nf += 1;
+            next += interval;
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            let i = u32::from_be_bytes(m.payload[..4].try_into().unwrap()) as usize;
+            if now - sent_at[i] <= deadline {
+                ok.insert(i);
+            }
+        }
+        false
+    });
+    let lost = (0..frames).filter(|f| (f * per..(f + 1) * per).any(|i| !ok.contains(&i))).count();
+    (lost, s.caller.stats().clone(), s.conn().stats().clone())
+}
+
+/// Exploration (not a pass/fail bar): the cells where libsrt is weakest,
+/// RTT 1 ms / L 40 ms at 5 % loss on every datagram both ways, ~166 Mbit/s
+/// (660 packets per 24 fps frame), 240 frames; plain ARQ and FEC 10x5
+/// staircase onreq. libsrt on Linode: 70+18L (plain), 98 (FEC) of 360.
+/// `cargo test --release --test sim weak_ -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn weak_rtt1_l40_5pct() {
+    let dl = Duration::from_millis(40 + 1 + 10);
+    for seed in [1u64, 2, 3] {
+        let (l, c, r) = weak_case(cfg(40), cfg(40), 500, 5.0, 660, 240, 0x5EED_0000 + seed, dl);
+        eprintln!("plain seed {seed}: frames lost {l}/240; rcv loss {} drop {} naks {} | snd retrans {} copies {} suppressed {} too-late {} probes t{} h{}",
+            r.pkt_rcv_loss, r.pkt_rcv_drop, r.pkt_sent_nak, c.pkt_retrans, c.pkt_rexmit_copies, c.pkt_rexmit_suppressed, c.pkt_rexmit_too_late, c.pkt_tail_probe, c.pkt_head_probe);
+        let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+        let (l, c, r) = weak_case(fcfg(40, f), fcfg(40, f), 500, 5.0, 660, 240, 0x5EED_0000 + seed, dl);
+        eprintln!("fec   seed {seed}: frames lost {l}/240; rcv loss {} drop {} supply {} filterloss {} naks {} | snd retrans {} copies {} stall {}",
+            r.pkt_rcv_loss, r.pkt_rcv_drop, r.pkt_rcv_filter_supply, r.pkt_rcv_filter_loss, r.pkt_sent_nak, c.pkt_retrans, c.pkt_rexmit_copies, c.pkt_stall_probe);
+    }
+}
+
+/// Exploration: set C (81.5 Mbit/s, ~322 packets per frame), small buffers.
+/// libsrt on Linode, frames lost of 360: RTT 30 / 1 %: L45 28+6L, L75 11;
+/// 5 %: L45 275+4L, L75 134, L120 20, L180 4. RTT 250 / 5 %: L375 214, L625 64.
+#[test]
+#[ignore]
+fn weak_set_c_small_buffers() {
+    for (rtt, pct, lat) in [(30u64, 1.0, 45u16), (30, 1.0, 75), (30, 5.0, 45), (30, 5.0, 75), (30, 5.0, 120), (30, 5.0, 180), (250, 5.0, 375), (250, 5.0, 625)] {
+        let dl = Duration::from_millis(lat as u64 + rtt / 2 + 10);
+        let (l, c, r) = weak_case(cfg(lat), cfg(lat), rtt * 500, pct, 322, 240, 0xC0FFEE, dl);
+        eprintln!("rtt {rtt} loss {pct}% L {lat}: frames lost {l}/240; rcv loss {} drop {} | snd retrans {} copies {} too-late {} tail {} head {} ackrexmit {} suppressed {}",
+            r.pkt_rcv_loss, r.pkt_rcv_drop, c.pkt_retrans, c.pkt_rexmit_copies, c.pkt_rexmit_too_late, c.pkt_tail_probe, c.pkt_head_probe, c.pkt_ack_rexmit, c.pkt_rexmit_suppressed);
+    }
+}
