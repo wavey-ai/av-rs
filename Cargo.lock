@@ -2162,8 +2162,11 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
+ "mio 1.2.5",
  "num-derive",
  "num-traits",
+ "srt-core",
+ "srt-mio",
  "srt-sys 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
 ]

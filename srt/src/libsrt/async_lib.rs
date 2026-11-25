@@ -13,14 +13,8 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    task::{spawn_blocking, JoinError, JoinHandle},
+    task::{spawn_blocking, JoinHandle},
 };
-
-impl From<JoinError> for Error {
-    fn from(e: JoinError) -> Error {
-        Error::JoinError(e)
-    }
-}
 
 pub struct AsyncListener<'c> {
     socket: Socket,

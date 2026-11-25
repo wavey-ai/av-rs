@@ -10,8 +10,13 @@ repository = "https://github.com/wavey-ai/av-rs"
 name = "srt"
 
 [features]
-default = []
-async = ["tokio", "srt-sys/async"]
+default = ["libsrt"]
+# The C backend: vendored libsrt 1.4.4 (srt-sys, needs cmake, bindgen and a C/C++ compiler).
+libsrt = ["dep:srt-sys"]
+# The pure Rust backend (srt-core + srt-mio). Use with default-features = false
+# so srt-sys is not built; when both backends are enabled, pure-rust is used.
+pure-rust = ["dep:srt-core", "dep:srt-mio", "dep:mio"]
+async = ["tokio", "srt-sys?/async"]
 
 [dependencies]
 log = "0.4"
@@ -20,4 +25,10 @@ lazy_static = "1.4.0"
 num-derive = "0.4"
 num-traits = "0.2"
 tokio = { version = "1.0", features = ["macros", "io-util", "rt-multi-thread"], optional = true }
-srt-sys = "0.1.0"
+srt-sys = { version = "0.1.0", optional = true }
+srt-core = { path = "srt-core", version = "0.1.0", optional = true }
+srt-mio = { path = "srt-mio", version = "0.1.0", optional = true }
+mio = { version = "1", features = ["os-poll", "net"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "io-util", "rt-multi-thread", "time"] }
