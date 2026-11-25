@@ -142,7 +142,9 @@ Sender (`SndLossList`, merged runs in order):
   went out for SRTT + min(4 RTTVar, SRTT/2) + 10 ms + 1 ms, retransmit the
   newest packet once (a lost tail is otherwise only seen when the next
   frame arrives).
-- Head probe: when the oldest unacknowledged packet was last sent that
+- Head probe: when the oldest unacknowledged packet, already retransmitted
+  once (libsrt receivers ACK a frame's tail late; a never-lost packet is
+  no reason), was last sent that
   same probe delay ago and no ACK passed it, send it again (its last copy
   or the NAK for it was lost; a libsrt receiver re-NAKs only after 300 ms
   until it has an RTT, and libsrt does not repeat an unchanged ACK).

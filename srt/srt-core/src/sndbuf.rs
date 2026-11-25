@@ -129,6 +129,12 @@ impl SndBuf {
         self.slots[(seq & self.mask) as usize].last_tx_us = now_us;
     }
 
+    /// Retransmissions of a held sequence so far.
+    #[inline]
+    pub fn rexmits(&self, seq: u32) -> u16 {
+        self.slots[(seq & self.mask) as usize].rexmits
+    }
+
     /// Count one retransmission of a held sequence; returns the new count.
     #[inline]
     pub fn count_rexmit(&mut self, seq: u32) -> u16 {

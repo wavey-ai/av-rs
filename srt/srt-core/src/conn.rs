@@ -1130,9 +1130,9 @@ impl Connection {
         self.rtt_valid || self.rtt_seeded
     }
 
-    /// Head probe: when the oldest unacknowledged packet was last sent a
-    /// probe delay ago and no ACK has passed it, its last copy (or the NAK
-    /// for it) was lost: send it again. Covers a lost repair whose re-NAK
+    /// Head probe: when the oldest unacknowledged packet was retransmitted
+    /// before, last sent a probe delay ago, and no ACK has passed it, its
+    /// last copy (or the NAK for it) was lost: send it again. Covers a lost repair whose re-NAK
     /// would come too late (a libsrt receiver re-NAKs after 300 ms until it
     /// has an RTT sample, then every max(RTT/2, 20 ms) with only one NAK
     /// per attempt), and does not depend on ACKs being repeated.
@@ -1141,7 +1141,9 @@ impl Connection {
             return None;
         }
         let una = self.snd.una;
-        if self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) {
+        // only a packet already repaired at least once (its loss is known;
+        // a slow ACK of a packet never reported lost is not a reason)
+        if self.snd.rexmits(una) == 0 || self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) {
             return None;
         }
         Some(self.snd.last_tx_us(una) + self.probe_delay_us())
