@@ -1337,7 +1337,9 @@ impl Connection {
         let min_repair = if self.rtt_valid { self.srtt as i64 } else { 0 };
         let max_words = (self.max_payload / 4).max(2);
         let mut out = std::mem::take(&mut self.nak_scratch);
-        let seqs = self.rcv_loss.collect_due(now_us, NAK_SLACK_US, interval, min_repair, max_words, &mut out);
+        // spread the remaining attempts up to deadline - (RTT + 5 ms)
+        let reserve = if self.rtt_valid { self.srtt as i64 + LAST_CHANCE_MARGIN_US } else { 0 };
+        let seqs = self.rcv_loss.collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, &mut out);
         self.renak_sched_us = interval;
         let r = if out.is_empty() {
             None
