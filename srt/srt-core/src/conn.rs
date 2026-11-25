@@ -39,6 +39,9 @@ const MAX_DROPREQ_QUEUE: usize = 64;
 const NAK_MARGIN_US: i64 = 2_000;
 /// Smallest re-NAK interval.
 const NAK_MIN_INTERVAL_US: i64 = 5_000;
+/// Re-NAKs are spread up to the hole's deadline minus the expected repair
+/// time and max(RTT / 8, this).
+const SPREAD_MARGIN_US: i64 = 10_000;
 /// A NAK also carries holes due within this much (fewer, fuller NAKs).
 const NAK_SLACK_US: i64 = 1_000;
 /// Tail probe: after SRTT + 4 RTTVar (at most SRTT / 2) + one ACK period
@@ -229,6 +232,8 @@ pub struct Connection {
     rttvar: u32,
     rtt_own: bool,
     rtt_valid: bool,
+    /// srtt/rttvar hold a handshake estimate (timers may use it).
+    rtt_seeded: bool,
 
     // control out
     ackacks: VecDeque<u32>,
@@ -318,6 +323,7 @@ impl Connection {
             rttvar: INIT_RTTVAR_US,
             rtt_own: false,
             rtt_valid: false,
+            rtt_seeded: false,
             ackacks: VecDeque::with_capacity(MAX_ACKACK_QUEUE),
             keepalive_due: false,
             shutdown_due: false,
@@ -635,6 +641,7 @@ impl Connection {
             if rtt > 0 {
                 self.srtt = rtt.min(10_000_000) as u32;
                 self.rttvar = self.srtt / 2;
+                self.rtt_seeded = true;
             }
         }
     }
@@ -665,6 +672,7 @@ impl Connection {
                     // sample arrives; not reported as valid
                     self.srtt = rtt.min(10_000_000) as u32;
                     self.rttvar = self.srtt / 2;
+                    self.rtt_seeded = true;
                 }
                 self.hs_sends = 0;
                 let mut c = Handshake {
@@ -926,7 +934,7 @@ impl Connection {
     /// waiting for another NAK (the oldest hole is the closest to its
     /// deadline; a NAK crossing this is suppressed as a duplicate).
     fn ack_head_check(&mut self, now_us: i64, x: u32) {
-        if !self.rtt_valid || x == self.snd.next_send || !self.snd.holds_sent(x) {
+        if !self.rtt_known() || x == self.snd.next_send || !self.snd.holds_sent(x) {
             return;
         }
         let age = now_us - self.snd.last_tx_us(x);
@@ -1053,6 +1061,13 @@ impl Connection {
                         self.stats.pkt_tail_probe += 1;
                     }
                 }
+                if let Some(t) = self.head_probe_at_us() {
+                    if now_us >= t {
+                        let s = self.snd.una;
+                        self.snd_loss.insert(s, s);
+                        self.stats.pkt_head_probe += 1;
+                    }
+                }
                 self.sender_drop(now_us);
             }
             State::Closed(_) => {}
@@ -1079,9 +1094,37 @@ impl Connection {
         if !self.cfg.tail_probe || !self.probe_armed || self.snd.unsent() > 0 || self.snd.in_flight() == 0 {
             return None;
         }
+        Some(self.last_data_tx_us + self.probe_delay_us())
+    }
+
+    /// How long without an ACK past a packet before probing it: one RTT,
+    /// its variation (at most RTT/2), one ACK period and a margin.
+    fn probe_delay_us(&self) -> i64 {
         let r = self.srtt as i64;
-        let d = r + (4 * self.rttvar as i64).min(r / 2) + SYN_US + PROBE_MARGIN_US;
-        Some(self.last_data_tx_us + d)
+        r + (4 * self.rttvar as i64).min(r / 2) + SYN_US + PROBE_MARGIN_US
+    }
+
+    /// RTT from ACK/ACKACK samples or the handshake estimate.
+    #[inline]
+    fn rtt_known(&self) -> bool {
+        self.rtt_valid || self.rtt_seeded
+    }
+
+    /// Head probe: when the oldest unacknowledged packet was last sent a
+    /// probe delay ago and no ACK has passed it, its last copy (or the NAK
+    /// for it) was lost: send it again. Covers a lost repair whose re-NAK
+    /// would come too late (a libsrt receiver re-NAKs after 300 ms until it
+    /// has an RTT sample, then every max(RTT/2, 20 ms) with only one NAK
+    /// per attempt), and does not depend on ACKs being repeated.
+    fn head_probe_at_us(&self) -> Option<i64> {
+        if !self.cfg.tail_probe || self.snd.in_flight() == 0 || !self.rtt_known() {
+            return None;
+        }
+        let una = self.snd.una;
+        if self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) {
+            return None;
+        }
+        Some(self.snd.last_tx_us(una) + self.probe_delay_us())
     }
 
     /// Sender drop of too-late packets (spec 7.6, 12 #8), on a timer. The
@@ -1113,14 +1156,14 @@ impl Connection {
             return None;
         }
         let lat = (self.snd_latency_ms as i64 + self.cfg.snd_drop_delay_ms as i64) * 1000;
-        let rtt = if self.rtt_valid { 2 * self.srtt as i64 } else { 0 };
+        let rtt = if self.rtt_known() { 2 * self.srtt as i64 } else { 0 };
         Some(lat + (lat / 4).max(SND_DROP_MARGIN_US) + rtt + SYN_US)
     }
 
     /// Do not retransmit a packet (re)sent less than this long ago: the
     /// request was sent before the previous copy could have arrived.
     fn rexmit_suppress_us(&self) -> i64 {
-        if !self.rtt_valid {
+        if !self.rtt_known() {
             return 0;
         }
         let (r, v) = (self.srtt as i64, self.rttvar as i64);
@@ -1155,6 +1198,9 @@ impl Connection {
                     t = t.min(h.detected_us + self.cfg.reorder_window_us as i64);
                 }
                 if let Some(p) = self.probe_at_us() {
+                    t = t.min(p);
+                }
+                if let Some(p) = self.head_probe_at_us() {
                     t = t.min(p);
                 }
                 if let (Some(thr), Some(o)) = (self.snd_drop_threshold_us(), self.snd.oldest_origin_us()) {
@@ -1303,7 +1349,7 @@ impl Connection {
     /// Too little time left before the receiver plays `seq` for another
     /// NAK round after this repair.
     fn last_chance(&self, seq: u32, now_us: i64) -> bool {
-        if !self.rtt_valid || self.snd_latency_ms == 0 {
+        if !self.rtt_known() || self.snd_latency_ms == 0 {
             return false;
         }
         let left = self.snd.origin_us(seq) + self.snd_latency_ms as i64 * 1000 - now_us;
@@ -1334,11 +1380,20 @@ impl Connection {
     /// ranges, at most maxPayload / 4 words (the rest follow in the next).
     fn encode_due_nak(&mut self, now_us: i64, ts: u32, buf: &mut [u8]) -> Option<usize> {
         let interval = self.renak_interval_us();
-        let min_repair = if self.rtt_valid { self.srtt as i64 } else { 0 };
+        let min_repair = if self.rtt_known() { self.srtt as i64 } else { 0 };
         let max_words = (self.max_payload / 4).max(2);
         let mut out = std::mem::take(&mut self.nak_scratch);
-        // spread the remaining attempts up to deadline - (RTT + 5 ms)
-        let reserve = if self.rtt_valid { self.srtt as i64 + LAST_CHANCE_MARGIN_US } else { 0 };
+        // spread the remaining attempts up to deadline - reserve: the last
+        // NAK must leave early enough for the repair (expected repair time
+        // + its variation) plus the sender's queueing (libsrt sends new
+        // data first: a frame burst) and its own drop (libsrt: latency +
+        // 20 ms after the origin)
+        let reserve = if self.rtt_known() {
+            let rt = (self.srtt as i64).max(if self.nak_rtt_valid { self.nak_srtt } else { 0 });
+            interval - NAK_MARGIN_US + (rt / 8).max(SPREAD_MARGIN_US)
+        } else {
+            0
+        };
         let seqs = self.rcv_loss.collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, &mut out);
         self.renak_sched_us = interval;
         let r = if out.is_empty() {

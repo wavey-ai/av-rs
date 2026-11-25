@@ -37,6 +37,9 @@ pub struct Stats {
     pub pkt_rexmit_suppressed: u64,
     /// Tail probes sent (newest packet retransmitted after a quiet RTT).
     pub pkt_tail_probe: u64,
+    /// Head probes: the oldest unacknowledged packet sent again after a
+    /// probe delay without an ACK past it.
+    pub pkt_head_probe: u64,
     /// Retransmissions queued because an ACK still stopped at a packet
     /// sent more than an RTT before (its last copy was lost).
     pub pkt_ack_rexmit: u64,

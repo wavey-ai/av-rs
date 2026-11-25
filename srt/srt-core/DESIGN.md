@@ -88,7 +88,13 @@ Receiver (`RcvLossList`, a `VecDeque` of holes in sequence order):
   suffix of the list, released in order, O(1) per packet).
 - Re-NAK each hole `max(SRTT, NAK->repair time) + min(4 x var, RTT/2) + 2
   ms` (floor 5 ms) after its last NAK, never when the repair could not
-  arrive before its deadline. The NAK->repair time is measured from holes
+  arrive before its deadline. The attempts a hole still has time for are
+  spread evenly up to its deadline minus (the repair time + its variation
+  + max(RTT/8, 10 ms)): as many attempts, but further apart, so a libsrt
+  sender (RETRANSMITALGO=1 suppresses a request arriving within SRTT - 4
+  RTTVar of its last copy, and it queues retransmissions behind new data)
+  does not swallow one, and the last one lands well before libsrt's own
+  drop at latency + 20 ms. The NAK->repair time is measured from holes
   NAKed once and repaired by a retransmission (Karn), so it includes the
   sender's queueing. Due holes go in one NAK as ranges (up to
   maxPayload/4 words; the rest in the next). The schedule is brought
@@ -120,13 +126,17 @@ Sender (`SndLossList`, merged runs in order):
   went out for SRTT + min(4 RTTVar, SRTT/2) + 10 ms + 1 ms, retransmit the
   newest packet once (a lost tail is otherwise only seen when the next
   frame arrives).
+- Head probe: when the oldest unacknowledged packet was last sent that
+  same probe delay ago and no ACK passed it, send it again (its last copy
+  or the NAK for it was lost; a libsrt receiver re-NAKs only after 300 ms
+  until it has an RTT, and libsrt does not repeat an unchanged ACK).
 - Sender drop on a timer: packets older than latency + SNDDROPDELAY +
   max(latency/4, 20 ms) + 2 SRTT + 10 ms leave the buffer, announced by a
   DROPREQ (libsrt: max(latency, 1 s) + 20 ms, checked only on send).
 - RTT before the first ACK/ACKACK sample: the caller seeds it from an
   unrepeated induction, the listener from the first packet after an
-  unrepeated conclusion response (used for timers only, not reported as
-  valid).
+  unrepeated conclusion response (used by the timers above, not reported
+  as a valid RTT).
 
 TSBPD wake-up: `poll_timeout` is recomputed after every input, so a repair
 that fills the head makes the head due at once or at its own time (the

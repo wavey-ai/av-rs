@@ -500,14 +500,12 @@ fn lost_retransmission_and_lost_nak_are_renaked() {
     }
     let r = s.conn().stats().clone();
     assert_eq!(r.pkt_rcv_drop, 0);
-    assert_eq!(r.pkt_sent_nak, 6, "three rounds, each sent twice");
-    assert_eq!(r.nak_seqs_sent, 2 + 2 + 1);
+    // the lost NAK pair is NAKed again; the lost repair of 1002 is sent
+    // again by the receiver's re-NAK or the sender's head probe,
+    // whichever comes first (the other is suppressed or not needed)
+    assert!(r.pkt_sent_nak >= 4 && r.pkt_sent_nak % 2 == 0, "{r:?}");
     let c = s.caller.stats().clone();
-    // 1004 once, 1002 three times (the third doubled, as a second
-    // repair), and a tail probe of 1007 while the ACK was held at 1002
-    assert!(c.pkt_tail_probe <= 1);
-    assert_eq!(c.pkt_retrans, 1 + 3 + c.pkt_tail_probe, "{c:?}");
-    assert_eq!(r.pkt_rcv_duplicate, 1 + c.pkt_tail_probe);
+    assert!(c.pkt_retrans >= 1 + 2 && c.pkt_retrans <= 1 + 3 + c.pkt_tail_probe + c.pkt_head_probe, "{c:?}");
     // one re-NAK interval is about one RTT (30 ms) + capped variation +
     // 2 ms, far below libsrt's 300 ms before its first periodic NAK
     let now = s.now;
@@ -607,8 +605,8 @@ fn sender_drop_announces_dropreq() {
     s.connect();
     s.run_until(Duration::from_millis(100), |_| false);
     // every data packet and every ACK lost: the sender holds the packets
-    // latency + max(latency/4, 20 ms) + 10 ms (+ 2 RTT, not measured here:
-    // no ACK) = 135 ms past their origin, then drops them and says so
+    // latency + max(latency/4, 20 ms) + 10 ms + 2 RTT (10 ms, from the
+    // handshake) = 155 ms past their origin, then drops them and says so
     s.drop = Box::new(|side, d| (side == "a" && data_seq(d).is_some()) || (side == "b" && ctl_type(d) == Some(packet::ctrl::ACK)));
     let t = s.now;
     for i in 0..6u8 {
@@ -616,7 +614,7 @@ fn sender_drop_announces_dropreq() {
     }
     assert!(s.run_until(Duration::from_millis(300), |s| s.caller.send_buffer_len() == 0));
     let e = s.now - t;
-    assert!(e >= Duration::from_millis(135) && e < Duration::from_millis(137), "{e:?}");
+    assert!(e >= Duration::from_millis(155) && e < Duration::from_millis(157), "{e:?}");
     let c = s.caller.stats().clone();
     assert_eq!(c.pkt_snd_drop, 6, "{c:?}");
     assert_eq!(c.pkt_sent_dropreq, 1);
@@ -758,4 +756,30 @@ fn random_loss_across_sequence_wrap() {
     assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_300)));
     assert!(r.pkt_rcv_loss > 20);
     assert_eq!((s.caller.stats().ack_invalid, s.caller.stats().nak_invalid), (0, 0));
+}
+
+#[test]
+fn head_probe_repairs_when_the_receiver_does_not_renak() {
+    // a receiver that NAKs once and never again (libsrt before its first
+    // RTT sample re-NAKs only after 300 ms): the original and the first
+    // repair of 302 are lost; the sender's head probe resends it
+    let mut s = Sim::new(cfg(120), cfg(120), 15, 300);
+    s.connect();
+    let (mut n, mut naks) = (0, 0);
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(302) {
+            n += 1;
+            return n <= 2;
+        }
+        if side == "b" && ctl_type(d) == Some(packet::ctrl::NAK) {
+            naks += 1;
+            return naks > 2;
+        }
+        false
+    });
+    let (lat, missing) = run_frames(&mut s, 3, 10, Duration::from_millis(40), Duration::from_millis(300));
+    assert_eq!(missing, 0, "{:?}", s.caller.stats());
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_200)), "{lat:?}");
+    assert!(s.caller.stats().pkt_head_probe >= 1);
+    assert_eq!(s.conn().stats().pkt_rcv_drop, 0);
 }
