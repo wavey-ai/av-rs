@@ -20,7 +20,8 @@ interoperates with libsrt 1.5.7. Wire rules: `transport-bench-srt/docs/rs2/srt-s
 | `seq` | 31-bit sequence arithmetic (`seq_cmp`, `seq_off`, `seq_add`), 26-bit message numbers, ACK numbers |
 | `packet` | header + control codec: data header, HANDSHAKE, KEEPALIVE, ACK (light/small/full), NAK (loss list), CGWARNING, SHUTDOWN, ACKACK, DROPREQ, PEERERROR, EXT/unknown. Decoding borrows the datagram; encoding writes into a caller buffer |
 | `handshake` | the 48-byte handshake CIF, extension blocks (HSREQ/HSRSP, SID, CONGESTION, FILTER, KMREQ/KMRSP, GROUP), word-swapped strings, request and rejection codes |
-| `filter` | packet-filter config parse / merge / compare (section 8.3); FEC itself is a later stage |
+| `filter` | packet-filter config parse / merge / compare (section 8.3) |
+| `fec` | the libsrt `fec` filter (section 8): config, group geometry (even, staircase), sender accumulators and FEC packets, receiver group rings, iterative rebuild, "unrebuildable" decisions |
 | `config` | `Config`: latency (rcv/peer), payload size, flow window, buffer sizes, max bandwidth, stream id, filter, timeouts |
 | `time` | local clock (`epoch`, µs since it), TSBPD time base with 32-bit wrap and drift tracer (6.7, 6.8) |
 | `sndbuf` | sender ring indexed by `seq & mask`: one contiguous preallocated byte area (header + payload per slot) plus per-slot metadata; pacing token bucket (7.4) |
@@ -160,6 +161,63 @@ TSBPD wake-up: `poll_timeout` is recomputed after every input, so a repair
 that fills the head makes the head due at once or at its own time (the
 libsrt "one frame late" defect, spec 6.10, cannot happen).
 
+## Packet filter `fec` (stage 3; spec 8, 12 #9-#11)
+
+Wire behaviour is libsrt 1.5.7's:
+
+- Negotiation (8.3) in `filter`; only type `fec` is accepted (FILTER 1014
+  otherwise, as libsrt). Both directions group from the caller's ISN:
+  offset `k = seq - ISN` (64-bit, so groups survive the 31-bit wrap).
+- Row r = packets `rC .. rC+C-1`. Column j's groups hold R packets C
+  apart, the first starting `shift(j)` rows down (staircase: `j mod R`;
+  even: 0), each next one R rows later. Packets above a column's first
+  group are row-protected only (as libsrt).
+- FEC packet: data packet, PP = 11, msgno 0, sequence of the group's last
+  packet, timestamp = XOR of timestamps, payload `[index (0xFF = row, else
+  column)] [KK XOR] [length XOR, BE u16] [payload XOR, P bytes]`, P = the
+  sender's payload size (1316 in the bench; <= 1452 with a filter). Sent
+  right after the data packet that completes its group, column first,
+  then row (libsrt: in the next pacing slots, after retransmissions and
+  before the next new packet). They share the pacer.
+- Sender: one row accumulator and one per column, reset when a new group
+  id arrives (a sender drop cannot misalign groups).
+- Receiver: row and column groups in two rings indexed by group number
+  (window: min(receive buffer, 4096) packets), with an XOR accumulator
+  each, a member count, an XOR of member indices (the one missing member
+  is found without a scan) and a FEC-seen flag. Accumulators remember how
+  far they are non-zero, so a reused group is never cleared byte by byte;
+  XOR runs over a packet's real length in 32-byte blocks (vectorised).
+  Rebuilt packets go into the receive buffer as received ones (they fill
+  holes; `pktRcvFilterSupplyTotal`) and into their crossing group, which
+  may rebuild in turn (checked against a brute-force peeling decoder in
+  the unit tests). FEC packets never enter the buffer or the loss list.
+
+Where we differ from libsrt (wire-compatible: only *when* NAKs go):
+
+- `arq:onreq` / `always`: a new loss's first NAK waits for the filter.
+  A group is *closed* when its FEC packet arrived or new (not
+  retransmitted) data past its last packet did (its FEC went out before
+  that packet). A missing packet whose protecting groups are all closed
+  and that is still missing cannot be rebuilt: its first NAK is due now
+  (`pktRcvFilterLossTotal` counts these). At the latest it is NAKed after
+  a cap: half of what the latency leaves after two re-NAK intervals,
+  within [5 ms, latency/4] (`always`: also <= SRTT/2; `fec_nak_cap_us`
+  overrides). Then the normal per-hole schedule re-NAKs it until its
+  deadline, with NAK copies. libsrt `onreq` NAKs an irrecoverable loss
+  exactly once, judged up to two matrices late (spec 8.7).
+- Large drop: a jump past the group history releases every loss before
+  it at once; otherwise closing the passed groups releases them row by
+  row (libsrt resets its groups without reporting, spec 8.8). Holes stay
+  in the loss list in any case, so the cap NAKs anything the filter never
+  decided on.
+- A FEC packet carries the sequence of the data packet just before it: if
+  that is beyond the highest received, the gap up to it is a loss now (a
+  lost tail of a burst is known without waiting for the next burst).
+- `arq:never`: no NAK at all; our sender also does no ACK-head
+  retransmission, tail or head probe (FEC only, as asked).
+- `pktRcvLossTotal` counts gaps in the arrival sequence before any
+  rebuild, as libsrt does (comparable with and without FEC).
+
 ## srt-mio
 
 - `SrtSocket::connect(local, remote, cfg)`: non-blocking; the handshake
@@ -197,6 +255,7 @@ UNSECURE (1011).
 
 1. codec, handshake, keepalive/shutdown/idle, TSBPD data path without
    loss recovery.
-2. (this) NAK (per-loss schedule), retransmission, sender drop, tail probe
+2. (done) NAK (per-loss schedule), retransmission, sender drop, tail probe
    (spec 12).
-3. FEC filter, GSO/GRO.
+3. (done) FEC filter.
+4. GSO/GRO, O(1) listener timeouts, encryption.
