@@ -605,11 +605,10 @@ fn random_loss_5pct_rtt250_l1000_listener_sends() {
 fn sender_drop_announces_dropreq() {
     let mut s = Sim::new(cfg(100), cfg(100), 5, 50);
     s.connect();
-    s.run_until(Duration::from_millis(100), |_| false); // RTT known
+    s.run_until(Duration::from_millis(100), |_| false);
     // every data packet and every ACK lost: the sender holds the packets
-    // latency + max(latency/4, 20 ms) (+ RTT/2, unknown here: no ACK) =
-    // 125 ms past their origin,
-    // then drops them and says so
+    // latency + max(latency/4, 20 ms) + 10 ms (+ 2 RTT, not measured here:
+    // no ACK) = 135 ms past their origin, then drops them and says so
     s.drop = Box::new(|side, d| (side == "a" && data_seq(d).is_some()) || (side == "b" && ctl_type(d) == Some(packet::ctrl::ACK)));
     let t = s.now;
     for i in 0..6u8 {
@@ -617,7 +616,7 @@ fn sender_drop_announces_dropreq() {
     }
     assert!(s.run_until(Duration::from_millis(300), |s| s.caller.send_buffer_len() == 0));
     let e = s.now - t;
-    assert!(e >= Duration::from_millis(125) && e < Duration::from_millis(127), "{e:?}");
+    assert!(e >= Duration::from_millis(135) && e < Duration::from_millis(137), "{e:?}");
     let c = s.caller.stats().clone();
     assert_eq!(c.pkt_snd_drop, 6, "{c:?}");
     assert_eq!(c.pkt_sent_dropreq, 1);
@@ -707,4 +706,56 @@ fn reorder_beyond_tolerance_is_naked() {
     let r = s.conn().stats().clone();
     assert_eq!((r.pkt_sent_nak, r.nak_seqs_sent), (2, 1));
     assert_eq!(s.caller.stats().pkt_retrans, 1);
+}
+
+#[test]
+fn ack_logic_light_every_64_full_every_10ms_and_quiet_when_idle() {
+    let mut s = Sim::new(cfg(120), cfg(120), 10, 40);
+    s.connect();
+    // 640 packets in one burst (paced at 1 Gbit/s: ~7 ms)
+    let mut m = vec![0u8; 1316];
+    for i in 0..640u32 {
+        m[..4].copy_from_slice(&i.to_be_bytes());
+        s.caller.send_message(s.now, &m, None).unwrap();
+    }
+    s.run_until(Duration::from_millis(100), |s| {
+        let now = s.now;
+        while s.conn().recv_message(now).is_some() {}
+        false
+    });
+    let r = s.conn().stats().clone();
+    // one light ACK per 64 packets between timed ACKs, a handful of timed
+    // (full/small) ACKs, each answered by an ACKACK
+    assert!((5..=10).contains(&r.pkt_sent_light_ack), "{r:?}");
+    assert!((1..=4).contains(&r.pkt_sent_ack), "{r:?}");
+    assert_eq!(r.pkt_recv_ackack, r.pkt_sent_ack);
+    assert_eq!(s.caller.send_buffer_len(), 0);
+    let c = s.caller.stats().clone();
+    assert_eq!(c.pkt_sent_ackack, r.pkt_sent_ack);
+    assert_eq!(c.pkt_tail_probe, 0);
+    // nothing new: no more ACKs while idle (the last one was confirmed)
+    let acks = r.pkt_sent_ack + r.pkt_sent_light_ack;
+    s.run_until(Duration::from_millis(500), |_| false);
+    let r = s.conn().stats().clone();
+    assert_eq!(r.pkt_sent_ack + r.pkt_sent_light_ack, acks);
+    // RTT from ACK/ACKACK on the receiver, reported to the sender
+    let now = s.now;
+    let rs = s.conn().snapshot(now);
+    assert!(rs.rtt_valid && (19_000..=22_000).contains(&rs.rtt_us), "{rs:?}");
+    assert!(s.caller.snapshot(now).rtt_valid);
+}
+
+#[test]
+fn random_loss_across_sequence_wrap() {
+    let isn = srt_core::seq::SEQ_MAX - 300;
+    let mut s = Sim::new(cfg(120), cfg(120), 15, isn);
+    s.connect();
+    let mut rng = Rng(777);
+    s.drop = Box::new(move |_, _| rng.chance(5.0));
+    let (lat, missing) = run_frames(&mut s, 10, 100, Duration::from_micros(41_667), Duration::from_millis(400));
+    let r = s.conn().stats().clone();
+    assert_eq!(missing, 0, "{r:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_300)));
+    assert!(r.pkt_rcv_loss > 20);
+    assert_eq!((s.caller.stats().ack_invalid, s.caller.stats().nak_invalid), (0, 0));
 }

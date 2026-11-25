@@ -25,6 +25,7 @@ interoperates with libsrt 1.5.7. Wire rules: `transport-bench-srt/docs/rs2/srt-s
 | `time` | local clock (`epoch`, µs since it), TSBPD time base with 32-bit wrap and drift tracer (6.7, 6.8) |
 | `sndbuf` | sender ring indexed by `seq & mask`: one contiguous preallocated byte area (header + payload per slot) plus per-slot metadata; pacing token bucket (7.4) |
 | `rcvbuf` | receiver ring indexed by `seq & mask`, same layout; contiguous-ACK point, cached "first present after the head" for O(1) TSBPD head/drop decisions |
+| `losslist` | receiver holes with a NAK schedule each; sender runs to retransmit (both ordered rings, no per-packet allocation) |
 | `conn` | `Connection`: handshake state machine (caller), connected state, timers, ACK/ACKACK/RTT, keepalive, peer idle, shutdown, stats |
 | `listener` | `Listener`: stateless induction with a keyed cookie, conclusion validation, HSREQ/filter/SID negotiation, rejections, dedupe of repeated conclusions; produces a `Connection` |
 | `stats` | counters named after libsrt's `CBytePerfMon` fields |
@@ -72,6 +73,65 @@ copied once into the I/O batch buffer.
 - ACK window: 1024-entry ring (ACK number -> seq, send time).
 - Handshake, listener maps and stats may allocate (once per connection).
 
+## Loss recovery (stage 2; spec 6, 7, 12)
+
+Receiver (`RcvLossList`, a `VecDeque` of holes in sequence order):
+
+- A gap found on arrival (`seq > highest + 1`) is appended as one hole with
+  its detection time and its deadline: the TSBPD time of the packet that
+  revealed it (the receiver gives the gap up when that packet is due).
+  A repaired sequence is found by binary search and cut out (split if
+  inside a run). Holes before the delivery point leave on a TSBPD drop;
+  a DROPREQ cuts its range out.
+- NAK at once (LOSSMAXTTL 0), else after LOSSMAXTTL more packets or
+  `reorder_window_us` (2 ms), whichever first (holes waiting for that are a
+  suffix of the list, released in order, O(1) per packet).
+- Re-NAK each hole `max(SRTT, NAK->repair time) + min(4 x var, RTT/2) + 2
+  ms` (floor 5 ms) after its last NAK, never when the repair could not
+  arrive before its deadline. The NAK->repair time is measured from holes
+  NAKed once and repaired by a retransmission (Karn), so it includes the
+  sender's queueing. Due holes go in one NAK as ranges (up to
+  maxPayload/4 words; the rest in the next). The schedule is brought
+  forward when the RTT estimate falls (first sample). libsrt instead
+  re-sends its whole loss list every max(RTT/2 + 2 RTTVar, 20 ms), 300 ms
+  before its first RTT sample.
+- Every NAK is sent twice (`repair_copies`): a lost NAK no longer costs a
+  round.
+
+Sender (`SndLossList`, merged runs in order):
+
+- NAKed sequences we hold are queued; those already acknowledged or
+  dropped get a DROPREQ (queued, merged); a NAK beyond what was sent is
+  counted and ignored (libsrt would break the connection).
+- `poll_transmit` order: shutdown, handshake, ACKACK, ACK, NAK (and its
+  copy), DROPREQ, keepalive, retransmissions, new data. Retransmissions
+  share the pacer but go before new data (their deadlines are earlier;
+  libsrt sends new data first when TLPKTDROP is on).
+- A request for a packet (re)sent less than `max(SRTT - RTTVar, SRTT/2)`
+  ago is dropped: it was sent before the previous copy could arrive
+  (libsrt's periodic NAK repeats every request every ~20 ms).
+- The second retransmission of a packet on, or a repair with less than
+  1.5 SRTT + min(4 RTTVar, SRTT/2) + 5 ms left before the receiver plays
+  it, is sent twice.
+- ACK-head retransmission: an ACK stopping at a packet last sent more
+  than SRTT + 2 RTTVar + 1 ms earlier means that copy was lost: queue it
+  without waiting for the next NAK.
+- Tail probe: when nothing is unsent, packets are in flight and no data
+  went out for SRTT + min(4 RTTVar, SRTT/2) + 10 ms + 1 ms, retransmit the
+  newest packet once (a lost tail is otherwise only seen when the next
+  frame arrives).
+- Sender drop on a timer: packets older than latency + SNDDROPDELAY +
+  max(latency/4, 20 ms) + 2 SRTT + 10 ms leave the buffer, announced by a
+  DROPREQ (libsrt: max(latency, 1 s) + 20 ms, checked only on send).
+- RTT before the first ACK/ACKACK sample: the caller seeds it from an
+  unrepeated induction, the listener from the first packet after an
+  unrepeated conclusion response (used for timers only, not reported as
+  valid).
+
+TSBPD wake-up: `poll_timeout` is recomputed after every input, so a repair
+that fills the head makes the head due at once or at its own time (the
+libsrt "one frame late" defect, spec 6.10, cannot happen).
+
 ## srt-mio
 
 - `SrtSocket::connect(local, remote, cfg)`: non-blocking; the handshake
@@ -107,7 +167,8 @@ UNSECURE (1011).
 
 ## Stage plan
 
-1. (this) codec, handshake, keepalive/shutdown/idle, TSBPD data path without
+1. codec, handshake, keepalive/shutdown/idle, TSBPD data path without
    loss recovery.
-2. NAK (per-loss schedule), retransmission, sender drop, tail probe (spec 12).
+2. (this) NAK (per-loss schedule), retransmission, sender drop, tail probe
+   (spec 12).
 3. FEC filter, GSO/GRO.

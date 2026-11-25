@@ -51,7 +51,7 @@ const ACK_HEAD_MARGIN_US: i64 = 1_000;
 /// (at most SRTT / 2) + this remains before the receiver plays the packet: send it twice.
 const LAST_CHANCE_MARGIN_US: i64 = 5_000;
 /// Sender drop: hold a packet at least latency + max(latency / 4, this)
-/// (+ SRTT) past its origin (spec 12 #8; libsrt holds >= 1 s).
+/// (+ 2 SRTT + 10 ms) past its origin (spec 12 #8; libsrt holds >= 1 s).
 const SND_DROP_MARGIN_US: i64 = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1101,18 +1101,20 @@ impl Connection {
     }
 
     /// How long past its origin a packet is held: the peer's latency (+
-    /// SNDDROPDELAY) + max(latency / 4, 20 ms) + SRTT. A retransmission
-    /// later than origin + latency arrives after the receiver gave the
-    /// packet up (it drops a gap when the next present packet is due, one
-    /// way after), and the ACK past such a gap reaches us about an RTT
-    /// after that. libsrt holds max(latency + SNDDROPDELAY, 1 s) + 20 ms.
+    /// SNDDROPDELAY) + max(latency / 4, 20 ms) + 2 SRTT + one ACK period.
+    /// A retransmission later than origin + latency arrives after the
+    /// receiver gave the packet up (it drops a gap when the next present
+    /// packet is due, one way after), and the ACK past such a gap reaches
+    /// us within one ACK period and one way after that; the rest is margin
+    /// so that packets the receiver has are released by its ACK, not
+    /// dropped here. libsrt holds max(latency + SNDDROPDELAY, 1 s) + 20 ms.
     fn snd_drop_threshold_us(&self) -> Option<i64> {
         if self.peer_flags & flags::TLPKTDROP == 0 || self.cfg.snd_drop_delay_ms < 0 || !self.cfg.tlpktdrop {
             return None;
         }
         let lat = (self.snd_latency_ms as i64 + self.cfg.snd_drop_delay_ms as i64) * 1000;
-        let rtt = if self.rtt_valid { self.srtt as i64 } else { 0 };
-        Some(lat + (lat / 4).max(SND_DROP_MARGIN_US) + rtt)
+        let rtt = if self.rtt_valid { 2 * self.srtt as i64 } else { 0 };
+        Some(lat + (lat / 4).max(SND_DROP_MARGIN_US) + rtt + SYN_US)
     }
 
     /// Do not retransmit a packet (re)sent less than this long ago: the

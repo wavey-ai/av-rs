@@ -584,6 +584,36 @@ mod tests {
     }
 
     #[test]
+    fn nak_wire_format_and_wrapping_range() {
+        // a run across the 31-bit wrap is one range: first | 0x8000_0000, last
+        let mut b = [0u8; 64];
+        let n = encode_nak([(0x7FFF_FFFE, 1), (7, 7)], 0x01020304, 0x0A0B0C0D, 364, &mut b);
+        assert_eq!(
+            &b[..n],
+            &[
+                0x80, 0x03, 0x00, 0x00, 0, 0, 0, 0, 1, 2, 3, 4, 0x0A, 0x0B, 0x0C, 0x0D, // header
+                0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x00, 0x00, 0x01, // range
+                0x00, 0x00, 0x00, 0x07, // single
+            ]
+        );
+        match decode(&b[..n]).unwrap() {
+            Packet::Control { body: Control::Nak(l), .. } => {
+                assert_eq!(l.ranges().collect::<Vec<_>>(), vec![(0x7FFF_FFFE, 1), (7, 7)]);
+            }
+            p => panic!("{p:?}"),
+        }
+        // libsrt may send a run of 2 as a range or two singles: both read
+        let mut b = [0u8; 32];
+        ControlHeader::new(ctrl::NAK, 0, 0, 0).encode(&mut b);
+        wr32(&mut b, 16, 9);
+        wr32(&mut b, 20, 10);
+        match decode(&b[..24]).unwrap() {
+            Packet::Control { body: Control::Nak(l), .. } => assert_eq!(l.ranges().collect::<Vec<_>>(), vec![(9, 9), (10, 10)]),
+            p => panic!("{p:?}"),
+        }
+    }
+
+    #[test]
     fn dropreq_round_trip() {
         let mut b = [0u8; 32];
         let n = encode_dropreq(9, 100, 200, 1, 2, &mut b);
