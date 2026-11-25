@@ -1495,6 +1495,7 @@ fn lost_tail_is_still_repaired_with_a_slow_acking_peer() {
 
 /// Frames lost (any packet missing or later than `deadline`) for `frames`
 /// bursts of `per` packets every 41.667 ms, random loss `pct` both ways.
+#[allow(clippy::too_many_arguments)]
 fn weak_case(ccfg: Config, lcfg: Config, owd_us: u64, pct: f64, per: usize, frames: usize, seed: u64, deadline: Duration) -> (usize, srt_core::Stats, srt_core::Stats) {
     let mut s = Sim::new(ccfg, lcfg, 0, 9);
     s.owd = Duration::from_micros(owd_us);

@@ -20,6 +20,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+#[allow(clippy::large_enum_variant)] // one value per process
 enum End {
     Call(SrtSocket),
     Listen(SrtListener, Option<u32>),
