@@ -122,6 +122,8 @@ pub(crate) struct ConnState {
     pub rx_waker: Option<Waker>,
     pub tx_waker: Option<Waker>,
     pub max_message: usize,
+    /// Negotiated (receive, send) TSBPD latency, ms.
+    pub latency_ms: (u16, u16),
     pub stream_id: Option<String>,
     pub peer: SocketAddr,
     pub stats: Option<Stats>,
@@ -158,6 +160,7 @@ impl ConnShared {
                 rx_waker: None,
                 tx_waker: None,
                 max_message,
+                latency_ms: (0, 0),
                 stream_id: stream_id.filter(|s| !s.is_empty()),
                 peer,
                 stats: None,
@@ -276,6 +279,10 @@ impl ConnShared {
     pub fn close_reason(&self) -> Option<CloseReason> {
         lock(&self.st).close_reason.clone()
     }
+
+    pub fn latency_ms(&self) -> (u16, u16) {
+        lock(&self.st).latency_ms
+    }
 }
 
 /// Whether a lingering connection is done: all written data acknowledged.
@@ -313,6 +320,7 @@ fn service(conn: &mut Connection, sh: &ConnShared, now: Instant, lingering: bool
         if ev == Event::Connected && st.status == Status::Connecting {
             st.status = Status::Open;
             st.max_message = conn.max_message();
+            st.latency_ms = conn.latencies_ms();
             wake_rx = true;
             wake_tx = true;
         }
@@ -795,6 +803,7 @@ fn run_listener(io: &mut Io, l: &mut SrtListener, ls: &Arc<ListenerShared>) {
                         c.stream_id().map(str::to_string),
                         c.max_message(),
                     );
+                    lock(&sh.st).latency_ms = c.latencies_ms();
                     conns.insert(id, sh.clone());
                     new.push((sh, c.peer_addr()));
                     room -= 1;

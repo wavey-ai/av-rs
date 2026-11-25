@@ -126,6 +126,12 @@ impl AsyncStream {
     pub fn close_reason(&self) -> Option<super::srt_core::CloseReason> {
         self.h.sh.close_reason()
     }
+
+    /// Negotiated TSBPD latency (receive, send), ms: each side uses the
+    /// larger of its own and the peer's proposal.
+    pub fn latency_ms(&self) -> (u16, u16) {
+        self.h.sh.latency_ms()
+    }
 }
 
 impl AsyncRead for AsyncStream {

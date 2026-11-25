@@ -32,3 +32,7 @@ mio = { version = "1", features = ["os-poll", "net"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "io-util", "rt-multi-thread", "time"] }
+
+[[example]]
+name = "srt-interop"
+required-features = ["async"]
