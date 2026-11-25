@@ -82,6 +82,11 @@ pub struct Config {
     /// packet is allowed, so each wake-up sends a batch (the pacer's 1 ms
     /// burst allowance keeps the rate). Not an SRT option.
     pub pace_quantum_us: u32,
+    /// With FEC, the extra time an ACK may stop at a never-retransmitted
+    /// packet before the sender takes it as lost (ACK-head check and stall
+    /// probe), us; negative = auto (max(latency / 4, 10 ms)). Not an SRT
+    /// option.
+    pub fec_ack_head_delay_us: i32,
 }
 
 impl Default for Config {
@@ -113,6 +118,7 @@ impl Default for Config {
             repair_copies: true,
             ack_rttvar_floor: true,
             pace_quantum_us: 250,
+            fec_ack_head_delay_us: -1,
         }
     }
 }

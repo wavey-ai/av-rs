@@ -47,6 +47,13 @@ pub struct Stats {
     /// Extra copies sent of late repairs (second retransmission on, or too
     /// close to the deadline for another round).
     pub pkt_rexmit_copies: u64,
+    /// FEC stall probes: the oldest unacknowledged packet (never
+    /// retransmitted) sent again after an ACK-head threshold without an ACK
+    /// past it (a libsrt `onreq` receiver may never report its loss).
+    pub pkt_stall_probe: u64,
+    /// NAKed sequences not retransmitted because the copy would reach the
+    /// receiver after its play time.
+    pub pkt_rexmit_too_late: u64,
     /// DROPREQ packets sent (sequences we no longer hold).
     pub pkt_sent_dropreq: u64,
 
@@ -69,12 +76,18 @@ pub struct Stats {
     pub pkt_rcv_belated: u64,
     pub pkt_rcv_duplicate: u64,
     pub pkt_rcv_too_far: u64,
+    /// Receive-window restarts: a packet beyond the buffer arrived with the
+    /// buffer empty (libsrt breaks the connection there).
+    pub pkt_rcv_resync: u64,
+    /// Full ACKs sent to reopen the sender's flow window (we had
+    /// advertised little or no room).
+    pub pkt_sent_window_ack: u64,
     /// FEC packets received (pktRcvFilterExtraTotal).
     pub pkt_rcv_filter_extra: u64,
     /// Packets rebuilt by FEC (pktRcvFilterSupplyTotal).
     pub pkt_rcv_filter_supply: u64,
     /// Losses the filter found unrebuildable and handed to NAK
-    /// (pktRcvFilterLossTotal; libsrt counts what its `onreq` reports).
+    /// (pktRcvFilterLossTotal; as libsrt, counted for `onreq` only).
     pub pkt_rcv_filter_loss: u64,
     /// Losses found from a FEC packet's sequence (the tail of a burst),
     /// before any later data packet.

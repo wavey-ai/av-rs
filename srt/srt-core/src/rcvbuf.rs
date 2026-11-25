@@ -274,6 +274,49 @@ impl RcvBuf {
         n as u32
     }
 
+    /// Restart the window at `base` (spec 6.2 step 3, done better than
+    /// libsrt, which breaks the connection): the buffer is empty and a
+    /// packet arrived beyond its capacity, after an outage or a sender-side
+    /// drop longer than the buffer. Everything before `base` is given up.
+    pub fn resync(&mut self, base: u32) {
+        debug_assert_eq!(self.count, 0);
+        self.base = base;
+        self.ack = base;
+        self.highest = seq_dec(base);
+        self.hint = None;
+    }
+
+    /// The sender will never send `..=last` (DROPREQ): move the delivery
+    /// point over the absent packets at the head, up to `last` or the first
+    /// present packet. Returns how many were skipped.
+    pub fn skip_absent(&mut self, last: u32) -> u32 {
+        if !seq_le(self.base, last) || self.present(self.base) {
+            return 0;
+        }
+        let target = match self.first_present() {
+            Some(p) if seq_le(p.seq, last) => p.seq,
+            _ => seq_inc(last),
+        };
+        // never past the window (highest stays below base + capacity)
+        let target = if seq_off(self.base, target) as u32 > self.cap {
+            crate::seq::seq_add(self.base, self.cap as i32)
+        } else {
+            target
+        };
+        self.drop_until(target)
+    }
+
+    /// The sender dropped up to `last` (DROPREQ) beyond what we received:
+    /// the highest "received" moves there (within the window), so the next
+    /// packet does not report the dropped range as a new loss.
+    pub fn note_dropped_upto(&mut self, last: u32) {
+        if !seq_lt(self.highest, last) {
+            return;
+        }
+        let max = crate::seq::seq_add(self.base, self.cap as i32 - 1);
+        self.highest = if seq_lt(max, last) { max } else { last };
+    }
+
     /// Timestamp span from the first present packet to the highest, us.
     pub fn timestamp_span_us(&self) -> u32 {
         let first = self.head().or_else(|| self.first_present());
@@ -356,5 +399,72 @@ mod tests {
         assert_eq!(b.pop().unwrap().seq, 3);
         assert_eq!(b.len(), 0);
         assert!(b.first_present().is_none());
+    }
+
+    #[test]
+    fn resync_after_a_gap_beyond_capacity() {
+        let isn = SEQ_MAX - 10;
+        let mut b = RcvBuf::new(64, 1456, isn);
+        for i in 0..5 {
+            ins(&mut b, isn.wrapping_add(i) & SEQ_MAX);
+        }
+        while b.pop().is_some() {}
+        assert_eq!(b.len(), 0);
+        let far = (isn + 500) & SEQ_MAX;
+        assert_eq!(ins(&mut b, far), Insert::TooFar);
+        let nb = crate::seq::seq_add(far, -32);
+        b.resync(nb);
+        assert_eq!((b.base, b.ack, b.highest), (nb, nb, seq_dec(nb)));
+        assert_eq!(
+            ins(&mut b, far),
+            Insert::Stored {
+                loss: Some((nb, seq_dec(far))),
+                filled_hole: false
+            }
+        );
+        assert_eq!(
+            ins(&mut b, seq_inc(far)),
+            Insert::Stored {
+                loss: None,
+                filled_hole: false
+            }
+        );
+        assert_eq!(b.first_present().unwrap().seq, far);
+        assert_eq!(b.drop_until(far), 32);
+        assert_eq!(b.pop().unwrap().seq, far);
+    }
+
+    #[test]
+    fn dropreq_skips_absent_head_and_moves_highest() {
+        let mut b = RcvBuf::new(64, 1456, 100);
+        ins(&mut b, 100);
+        ins(&mut b, 105);
+        b.pop().unwrap();
+        // 101..=104 missing; DROPREQ 101..=103: skip to 104
+        assert_eq!(b.skip_absent(103), 3);
+        assert_eq!((b.base, b.ack), (104, 104));
+        // DROPREQ beyond the first present stops at it
+        assert_eq!(b.skip_absent(110), 1);
+        assert_eq!(b.base, 105);
+        assert_eq!(b.skip_absent(110), 0); // head present
+        assert_eq!(b.pop().unwrap().seq, 105);
+        // empty: a DROPREQ for unsent packets beyond what we received
+        b.note_dropped_upto(120);
+        assert_eq!(b.highest, 120);
+        assert_eq!(b.skip_absent(120), 15);
+        assert_eq!((b.base, b.ack), (121, 121));
+        assert_eq!(
+            ins(&mut b, 121),
+            Insert::Stored {
+                loss: None,
+                filled_hole: false
+            }
+        );
+        // never beyond the window
+        b.pop().unwrap();
+        b.note_dropped_upto(10_000);
+        assert_eq!(b.highest, 122 + 63);
+        assert_eq!(b.skip_absent(10_000), 64);
+        assert_eq!(b.base, 122 + 64);
     }
 }

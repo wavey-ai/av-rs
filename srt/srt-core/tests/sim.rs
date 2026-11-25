@@ -1141,3 +1141,294 @@ fn fec_large_drop_is_naked_not_dropped_silently() {
     assert_eq!(r.pkt_rcv_drop, 0);
     assert!(r.pkt_rcv_filter_loss >= 690, "{r:?}");
 }
+
+// ------------------------------------------------------------ outages and stalls
+
+struct StreamOut {
+    sent: u32,
+    /// Send time of each message, from the start.
+    sent_at: Vec<Duration>,
+    /// (message, delivery time from the start)
+    got: Vec<(u32, Duration)>,
+}
+
+impl StreamOut {
+    /// Messages sent at or after `from` that never arrived.
+    fn lost_sent_after(&self, from: Duration) -> Vec<u32> {
+        let set: std::collections::HashSet<u32> = self.got.iter().map(|g| g.0).collect();
+        (0..self.sent).filter(|i| self.sent_at[*i as usize] >= from && !set.contains(i)).collect()
+    }
+}
+
+/// The caller sends `per` messages every ms for `dur`; everything is
+/// dropped both ways from `out0` to `out1` (an outage) and the reader does
+/// not read from `stall0` to `stall1`. Payloads, order and duplicates are
+/// checked.
+fn run_stream(s: &mut Sim, per: usize, dur: Duration, tail: Duration, out: (Duration, Duration), stall: (Duration, Duration)) -> StreamOut {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let flag = Rc::new(Cell::new(false));
+    let f2 = flag.clone();
+    let mut prev = std::mem::replace(&mut s.drop, Box::new(|_, _| false));
+    s.drop = Box::new(move |side, d| f2.get() || prev(side, d));
+    let start = s.now;
+    let mut next = start;
+    let mut o = StreamOut {
+        sent: 0,
+        sent_at: Vec::new(),
+        got: Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Option<u32> = None;
+    s.run_until(dur + tail, |s| {
+        let el = s.now - start;
+        flag.set(el >= out.0 && el < out.1);
+        if el < dur && s.now >= next {
+            for _ in 0..per {
+                let now = s.now;
+                // a full send buffer (window closed) refuses: the message
+                // is lost, as a live source would lose it
+                let _ = s.caller.send_message(now, &vmsg(o.sent), None);
+                o.sent_at.push(el);
+                o.sent += 1;
+            }
+            next += Duration::from_millis(1);
+        }
+        if el < stall.0 || el >= stall.1 {
+            let now = s.now;
+            while let Some(m) = s.conn().recv_message(now) {
+                let i = u32::from_be_bytes(m.payload[..4].try_into().unwrap());
+                assert_eq!(m.payload, &vmsg(i)[..], "payload of {i}");
+                assert!(seen.insert(i), "delivered twice: {i}");
+                if let Some(l) = last {
+                    assert!(i > l, "out of order: {i} after {l}");
+                }
+                last = Some(i);
+                o.got.push((i, el));
+            }
+        }
+        false
+    });
+    o
+}
+
+#[test]
+fn outage_longer_than_the_receive_buffer_resyncs_and_resumes() {
+    // 10k msg/s, receive buffer 8192: a 2 s outage is 2.4 buffers; libsrt
+    // breaks the connection here, we restart the window and go on
+    for f in [
+        None,
+        Some("fec,cols:10,rows:5,layout:staircase,arq:onreq"),
+        Some("fec,cols:10,rows:1,arq:never"),
+    ] {
+        let c = match f {
+            Some(f) => fcfg(120, f),
+            None => cfg(120),
+        };
+        let mut s = Sim::new(c.clone(), c, 15, 0x7FFF_F000);
+        s.connect();
+        let ms = Duration::from_millis;
+        let o = run_stream(&mut s, 10, ms(4000), ms(600), (ms(500), ms(2500)), (ms(9999), ms(9999)));
+        let r = s.conn().stats().clone();
+        assert!(s.caller.is_connected() && s.conn().is_connected(), "{f:?}");
+        let lost = o.lost_sent_after(ms(2500) + ms(300));
+        assert!(
+            lost.is_empty(),
+            "{f:?}: lost after the outage {:?} ({} in all)",
+            &lost[..lost.len().min(8)],
+            lost.len()
+        );
+        assert!(r.pkt_rcv_resync >= 1, "{f:?}: {r:?}");
+        // delivery resumed within latency + a few RTT of the outage's end
+        let first_after = o.got.iter().find(|g| o.sent_at[g.0 as usize] >= ms(2500)).expect("nothing after the outage").1;
+        assert!(first_after < ms(2500) + ms(250), "{f:?}: resumed at {first_after:?}");
+        // nothing sent before the outage went missing
+        assert!(
+            o.lost_sent_after(Duration::ZERO).iter().all(|i| o.sent_at[*i as usize] >= ms(500) - ms(200)),
+            "{f:?}"
+        );
+    }
+}
+
+#[test]
+fn dropreq_at_the_head_moves_the_receive_window() {
+    // receive buffer 2048 packets (0.41 s at 5k msg/s), latency 120 ms, a
+    // 0.3 s outage: 1500 lost + 600 arriving before the first of them is
+    // due exceed the buffer. The sender's DROPREQs for what it gave up must
+    // move the window past the gap (no TooFar), not each packet's play time
+    for f in [None, Some("fec,cols:10,rows:5,layout:staircase,arq:onreq")] {
+        let mk = |c: Config| Config {
+            rcv_buf_pkts: 2048,
+            flow_window: 2048,
+            ..c
+        };
+        let c = match f {
+            Some(f) => mk(fcfg(120, f)),
+            None => mk(cfg(120)),
+        };
+        let mut s = Sim::new(c.clone(), c, 15, 77);
+        s.connect();
+        let ms = Duration::from_millis;
+        let o = run_stream(&mut s, 5, ms(2000), ms(500), (ms(500), ms(800)), (ms(9999), ms(9999)));
+        let r = s.conn().stats().clone();
+        eprintln!(
+            "{f:?}: too_far {} resync {} dropreq {} drop {} naks {}",
+            r.pkt_rcv_too_far, r.pkt_rcv_resync, r.pkt_recv_dropreq, r.pkt_rcv_drop, r.pkt_sent_nak
+        );
+        let lost = o.lost_sent_after(ms(800));
+        assert!(
+            lost.is_empty(),
+            "{f:?}: lost after the outage {:?} ({} in all)",
+            &lost[..lost.len().min(8)],
+            lost.len()
+        );
+        assert_eq!((r.pkt_rcv_too_far, r.pkt_rcv_resync), (0, 0), "{f:?}");
+        assert!(r.pkt_recv_dropreq > 0);
+        assert!(s.conn().is_connected());
+    }
+}
+
+#[test]
+fn dropreq_beyond_the_buffer_moves_the_window_without_resync() {
+    // receive buffer 256 packets, 1 msg/ms: 300 packets (0.3 s) are lost on
+    // the way, then the source pauses 0.5 s. The sender gives them up and its DROPREQ moves
+    // the receiver's window past them: the next packets fit (no TooFar, no
+    // restart) and are delivered
+    let c = Config {
+        rcv_buf_pkts: 256,
+        flow_window: 256,
+        ..cfg(120)
+    };
+    let mut s = Sim::new(c.clone(), c, 15, 0x7FFF_FF00);
+    s.connect();
+    let ms = Duration::from_millis;
+    let start = s.now;
+    let mut next = start;
+    let mut sent = 0u32;
+    let mut got = Vec::new();
+    let lose = std::rc::Rc::new(std::cell::Cell::new(false));
+    let l2 = lose.clone();
+    s.drop = Box::new(move |side, d| side == "a" && l2.get() && data_seq(d).is_some());
+    s.run_until(ms(1600), |s| {
+        let el = s.now - start;
+        lose.set(el >= ms(300) && el < ms(600));
+        // tail probes of the lost tail are lost too
+        let sending = el < ms(600) || (el >= ms(1100) && el < ms(1400));
+        if sending && s.now >= next {
+            for _ in 0..1 {
+                let now = s.now;
+                s.caller.send_message(now, &vmsg(sent), None).unwrap();
+                sent += 1;
+            }
+        }
+        if s.now >= next {
+            next += ms(1);
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            got.push(u32::from_be_bytes(m.payload[..4].try_into().unwrap()));
+        }
+        false
+    });
+    let r = s.conn().stats().clone();
+    assert!(r.pkt_recv_dropreq > 0, "{r:?}");
+    assert_eq!((r.pkt_rcv_too_far, r.pkt_rcv_resync), (0, 0), "{r:?}");
+    // all but (some of) the 300 lost ones; everything after the pause
+    assert!(got.len() as u32 >= sent - 300, "{r:?}");
+    assert!((sent - 300..sent).all(|i| got.contains(&i)));
+    assert!(got.windows(2).all(|w| w[0] < w[1]));
+}
+
+#[test]
+fn reader_stall_longer_than_the_buffer_reopens_the_window() {
+    // receive buffer and flow window 2048 packets (0.2 s at 10k msg/s);
+    // the reader stalls 1 s: the sender's window closes, and must reopen
+    // when the reader drains the buffer although the ACK value is unchanged
+    for f in [None, Some("fec,cols:10,rows:5,layout:staircase,arq:onreq")] {
+        let mk = |c: Config| Config {
+            rcv_buf_pkts: 2048,
+            flow_window: 2048,
+            ..c
+        };
+        let c = match f {
+            Some(f) => mk(fcfg(120, f)),
+            None => mk(cfg(120)),
+        };
+        let mut s = Sim::new(c.clone(), c, 15, 0x7FFF_FF00);
+        s.connect();
+        let mut rng = Rng(5);
+        s.drop = Box::new(move |side, _| side == "a" && rng.chance(1.0));
+        let ms = Duration::from_millis;
+        let o = run_stream(&mut s, 10, ms(3000), ms(500), (ms(9999), ms(9999)), (ms(500), ms(1500)));
+        let r = s.conn().stats().clone();
+        assert!(s.caller.is_connected() && s.conn().is_connected());
+        let n_after = o.got.iter().filter(|g| g.1 >= ms(2000)).count();
+        assert!(n_after > 9000, "{f:?}: delivered after 2 s: {n_after}");
+        // everything sent from an RTT after the reader resumed arrives
+        let lost = o.lost_sent_after(ms(1500) + ms(60));
+        assert!(
+            lost.is_empty(),
+            "{f:?}: lost after the stall {:?} ({} in all)",
+            &lost[..lost.len().min(8)],
+            lost.len()
+        );
+        assert!(r.pkt_sent_window_ack > 0, "{f:?}: {r:?}");
+    }
+}
+
+#[test]
+fn fec_stall_probe_repairs_an_unreported_loss_in_the_last_group() {
+    // FEC 10 x 5 onreq, one burst of 25 packets: packet 2 of the last,
+    // unfinished row is lost. A libsrt receiver never reports it (the
+    // group never closes) and sends the ACK stuck at it only until it is
+    // ACKACKed: model that by dropping every NAK and every repeat of that
+    // ACK. The sender's stall probe must repair it in time
+    let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+    let mut s = Sim::new(fcfg(120, f), fcfg(120, f), 15, 500);
+    s.connect();
+    let lost_seq = 522;
+    let mut lost = false;
+    let mut acks_at_hole = 0;
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(lost_seq) && !lost {
+            lost = true;
+            return true;
+        }
+        if side == "b" {
+            match packet::decode(d) {
+                Ok(Packet::Control { body: Control::Nak(_), .. }) => return true,
+                Ok(Packet::Control { body: Control::Ack(a), .. }) if a.seq == lost_seq => {
+                    acks_at_hole += 1;
+                    return acks_at_hole > 1;
+                }
+                _ => {}
+            }
+        }
+        false
+    });
+    let (lat, missing) = run_frames_v(&mut s, 1, 25, Duration::from_millis(40), Duration::from_millis(400));
+    let c = s.caller.stats().clone();
+    assert_eq!(missing, 0, "{c:?}");
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(135_200)), "{lat:?}");
+    assert!(c.pkt_stall_probe + c.pkt_ack_rexmit >= 1, "{c:?}");
+    assert_eq!(s.conn().stats().pkt_rcv_drop, 0);
+}
+
+#[test]
+fn data_with_a_key_is_dropped_not_fatal() {
+    let mut s = Sim::new(cfg(120), cfg(120), 15, 500);
+    s.connect();
+    s.run_until(Duration::from_millis(50), |_| false);
+    // a data packet with KK = 2 for the listener's socket
+    let sid = s.conn().local_socket_id();
+    let mut d = vec![0u8; 16 + 100];
+    d[0..4].copy_from_slice(&600u32.to_be_bytes());
+    d[4..8].copy_from_slice(&(0xC000_0001u32 | (2 << 27)).to_be_bytes());
+    d[12..16].copy_from_slice(&sid.to_be_bytes());
+    let (now, a) = (s.now, s.a);
+    s.conn().handle_datagram(now, a, &d);
+    assert!(s.conn().is_connected());
+    assert_eq!(s.conn().stats().pkt_rcv_undecrypt, 1);
+    let (_, missing) = run_frames(&mut s, 3, 10, Duration::from_millis(20), Duration::from_millis(300));
+    assert_eq!(missing, 0);
+}

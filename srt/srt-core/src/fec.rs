@@ -56,8 +56,8 @@ impl FecConfig {
         if c.kind != "fec" {
             return None;
         }
-        let cols: i64 = c.params.get("cols")?.parse().ok()?;
-        let rows: i64 = c.params.get("rows").map_or(Some(1), |v| v.parse().ok())?;
+        let cols = crate::filter::atoi(c.params.get("cols")?);
+        let rows = c.params.get("rows").map_or(1, |v| crate::filter::atoi(v));
         let staircase = c.params.get("layout").map_or(true, |v| v != "even");
         let arq = match c.params.get("arq").map(String::as_str) {
             Some("never") => ArqLevel::Never,
@@ -437,8 +437,13 @@ impl FecRx {
         let geo = Geometry::new(cfg);
         let w = window.max(64) as i64;
         let nrows = if geo.row_fec { ((w / geo.c + 4) as usize).next_power_of_two() } else { 0 };
+        // column groups: ids of the live ones span about 4 C; for huge C
+        // (beyond the window) at most a few windows' worth of slots, as
+        // fewer columns can be live (a collision only evicts an old group)
         let ncols = if geo.col_fec {
-            (((w / (geo.c * geo.r) + 4) * geo.c) as usize).next_power_of_two()
+            (((w / (geo.c * geo.r) + 4) * geo.c) as usize)
+                .next_power_of_two()
+                .min((8 * w as usize).next_power_of_two())
         } else {
             0
         };
@@ -795,6 +800,10 @@ mod tests {
         let c = cfg("fec,cols:8");
         assert_eq!((c.rows, c.row_fec, c.col_fec, c.staircase, c.arq), (1, true, false, true, ArqLevel::OnReq));
         assert!(FecConfig::parse("fec,rows:2").is_none());
+        // read as libsrt's atoi
+        let c = cfg("fec,cols:10x,rows: -3z");
+        assert_eq!((c.cols, c.rows, c.row_fec, c.col_fec), (10, 3, false, true));
+        assert!(FecConfig::parse("fec,cols:x10").is_none());
         assert!(FecConfig::parse("other,cols:2").is_none());
     }
 

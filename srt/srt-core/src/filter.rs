@@ -41,8 +41,11 @@ impl FilterConfig {
     fn fec_valid(&self) -> bool {
         for (k, v) in &self.params {
             let ok = match k.as_str() {
-                "cols" => v.parse::<i64>().map_or(false, |c| (2..=65535).contains(&c)),
-                "rows" => v.parse::<i64>().map_or(false, |r| r != 0 && r != -1 && r.abs() <= 65535),
+                "cols" => (2..=65535).contains(&atoi(v)),
+                "rows" => {
+                    let r = atoi(v);
+                    r != 0 && r != -1 && r.abs() <= 65535
+                }
                 "layout" => v == "even" || v == "staircase",
                 "arq" => v == "never" || v == "onreq" || v == "always",
                 _ => false,
@@ -133,6 +136,29 @@ pub fn negotiate_caller(own: Option<&str>, response: Option<&str>) -> Result<Opt
             FilterConfig::parse(r).ok_or(FilterMismatch)?;
             Ok(Some(r.to_string()))
         }
+    }
+}
+
+/// C `atoi` as libsrt reads `cols`/`rows` (`fec.cpp`): leading blanks, a
+/// sign, then digits up to the first other character; no digits = 0.
+pub(crate) fn atoi(s: &str) -> i64 {
+    let t = s.trim_start_matches(|c: char| c == ' ' || ('\t'..='\r').contains(&c));
+    let (neg, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in t.bytes() {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        n = (n * 10 + (b - b'0') as i64).min(1 << 40);
+    }
+    if neg {
+        -n
+    } else {
+        n
     }
 }
 

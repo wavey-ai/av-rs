@@ -210,6 +210,8 @@ pub struct Connection {
     last_ack_us: i64,
     last_full_ack_us: i64,
     last_ackack_seq: u32,
+    /// Receive room advertised in the last full/small ACK.
+    adv_avail: u32,
     pkts_since_ack: u32,
     ack_window: Vec<AckRec>,
     ack_due: Option<AckKind>,
@@ -232,6 +234,9 @@ pub struct Connection {
     /// Last data transmission (new or retransmitted): the tail probe base.
     last_data_tx_us: i64,
     probe_armed: bool,
+    /// The head sequence whose probes were given up (a copy would arrive
+    /// after its play time).
+    probe_dead: Option<u32>,
     /// The first holes given up (diagnosis).
     drop_log: Vec<crate::stats::DroppedHole>,
     /// The re-NAK interval last used to schedule holes.
@@ -329,6 +334,7 @@ impl Connection {
             last_ack_us: 0,
             last_full_ack_us: 0,
             last_ackack_seq: isn,
+            adv_avail: u32::MAX,
             pkts_since_ack: 0,
             ack_window: vec![AckRec::default(); ACK_WINDOW],
             ack_due: None,
@@ -347,6 +353,7 @@ impl Connection {
             dropreqs: VecDeque::with_capacity(MAX_DROPREQ_QUEUE),
             last_data_tx_us: 0,
             probe_armed: false,
+            probe_dead: None,
             renak_sched_us: NEVER,
             drop_log: Vec::new(),
             nak_copy: Vec::new(),
@@ -848,8 +855,10 @@ impl Connection {
             return;
         }
         if hdr.key != 0 {
+            // as libsrt without crypto: count it and drop it (one stray or
+            // forged packet must not close the connection)
             st.pkt_rcv_undecrypt += 1;
-            return self.set_closed(CloseReason::Encrypted);
+            return;
         }
         if payload.len() > self.max_payload {
             st.pkt_recv_malformed += 1;
@@ -872,6 +881,9 @@ impl Connection {
             self.rcv_started = true;
             self.next_ack_us = now_us + SYN_US;
             self.last_full_ack_us = now_us;
+        }
+        if seq_off(self.rcv.base, hdr.seq) >= self.rcv.capacity() as i32 && self.rcv.len() == 0 && self.tsbpd_rcv && self.cfg.tlpktdrop {
+            self.rcv_resync(hdr.seq);
         }
         match self.rcv.insert(hdr.seq, payload, hdr.timestamp, hdr.msgno, hdr.rexmit) {
             Insert::Stored { loss, filled_hole } => {
@@ -906,6 +918,28 @@ impl Connection {
         if self.pkts_since_ack >= LIGHT_ACK_PKTS && self.ack_due.is_none() && self.rcv.ack != self.last_ack_seq {
             self.ack_due = Some(AckKind::Light);
             self.pkts_since_ack = 0;
+        }
+    }
+
+    /// A packet `seq` beyond the receive buffer with the buffer empty: the
+    /// gap (an outage, or a sender-side drop longer than the buffer) can no
+    /// longer be delivered. libsrt breaks the connection here ("sequence
+    /// discrepancy", spec 6.2 step 3); we restart the window half a buffer
+    /// before `seq` instead: what came before is given up (counted as
+    /// dropped), the half buffer before `seq` becomes an ordinary loss
+    /// (NAKed; a sender that no longer holds it answers with DROPREQ) and
+    /// reception goes on.
+    fn rcv_resync(&mut self, seq: u32) {
+        let back = (self.rcv.capacity() / 2) as i32;
+        let nb = crate::seq::seq_add(seq, -back);
+        let gone = seq_off(self.rcv.base, nb).max(0) as u64;
+        self.stats.pkt_rcv_resync += 1;
+        self.stats.pkt_rcv_drop += gone;
+        self.stats.byte_rcv_drop += gone * (self.cfg.payload_size + PKT_OVERHEAD) as u64;
+        self.rcv.resync(nb);
+        self.rcv_loss.remove_before(nb);
+        if seq_lt(self.phy_highest, seq_dec(nb)) {
+            self.phy_highest = seq_dec(nb);
         }
     }
 
@@ -994,8 +1028,13 @@ impl Connection {
     }
 
     fn fec_release_range(&mut self, now_us: i64, first: u32, last: u32) {
-        if matches!(self.arq, Some(ArqLevel::OnReq) | Some(ArqLevel::Always)) {
-            self.stats.pkt_rcv_filter_loss += self.rcv_loss.release_range(first, last, now_us);
+        match self.arq {
+            // counted as libsrt does (fec.cpp reports losses only for onreq)
+            Some(ArqLevel::OnReq) => self.stats.pkt_rcv_filter_loss += self.rcv_loss.release_range(first, last, now_us),
+            Some(ArqLevel::Always) => {
+                self.rcv_loss.release_range(first, last, now_us);
+            }
+            _ => {}
         }
     }
 
@@ -1101,6 +1140,26 @@ impl Connection {
             return;
         }
         self.stats.pkt_rcv_dropreq_seqs += self.rcv_loss.remove_range(first, last);
+        if !seq_le(first, seq_inc(self.rcv.highest)) {
+            return; // a range after a gap we do not know about yet
+        }
+        // unsent or dropped packets beyond what we received: not a loss
+        // when the next packet comes
+        self.rcv.note_dropped_upto(last);
+        if seq_lt(self.phy_highest, self.rcv.highest) {
+            self.phy_highest = self.rcv.highest;
+        }
+        if seq_le(first, self.rcv.base) {
+            // the head is given up by the sender: move the delivery point
+            // (and the ACK) over it now instead of at the next packet's
+            // play time, so the window never wedges on it
+            let n = self.rcv.skip_absent(last);
+            if n > 0 {
+                self.stats.pkt_rcv_drop += n as u64;
+                self.stats.byte_rcv_drop += n as u64 * (self.cfg.payload_size + PKT_OVERHEAD) as u64;
+                self.rcv_loss.remove_before(self.rcv.base);
+            }
+        }
     }
 
     fn on_nak(&mut self, l: &LossList<'_>) {
@@ -1151,17 +1210,45 @@ impl Connection {
             return;
         }
         let age = now_us - self.snd.last_tx_us(x);
-        let mut thr = self.srtt as i64 + 2 * self.rttvar as i64 + ACK_HEAD_MARGIN_US;
-        if self.fec_tx.is_some() && self.snd.rexmits(x) == 0 {
-            // with FEC a receiver holds its ACK on a hole its filter will
-            // still rebuild (libsrt: up to two matrices): only a long stall
-            // means a lost packet whose one-shot onreq NAK was lost too
-            thr += (self.snd_latency_ms as i64 * 1000 / 4).max(SYN_US);
-        }
-        if age > thr {
+        if age > self.ack_head_threshold_us(x) {
             self.snd_loss.insert(x, x);
             self.stats.pkt_ack_rexmit += 1;
         }
+    }
+
+    /// How long after its last copy an ACK may still stop at `x` before
+    /// `x` is taken as lost: SRTT + 2 RTTVar + a margin; with FEC, for a
+    /// packet never retransmitted, also the FEC wait (a receiver holds its
+    /// ACK on a hole its filter will still rebuild; libsrt: up to two
+    /// matrices; only a longer stall means a loss whose one-shot `onreq`
+    /// NAK never came or was lost).
+    fn ack_head_threshold_us(&self, x: u32) -> i64 {
+        let mut thr = self.srtt as i64 + 2 * self.rttvar as i64 + ACK_HEAD_MARGIN_US;
+        if self.fec_tx.is_some() && self.snd.rexmits(x) == 0 {
+            thr += match self.cfg.fec_ack_head_delay_us {
+                d if d >= 0 => d as i64,
+                _ => (self.snd_latency_ms as i64 * 1000 / 4).max(SYN_US),
+            };
+        }
+        thr
+    }
+
+    /// With FEC: when the oldest unacknowledged packet, never
+    /// retransmitted, is still unacknowledged an ACK-head threshold and one
+    /// ACK period after it was sent, send it again. A libsrt `onreq`
+    /// receiver reports a loss only when a group closes, never one in the
+    /// last, unfinished group at the end of a stream, nor those its filter
+    /// forgets on a reset; it repeats a stuck ACK only until it is ACKACKed,
+    /// so the ACK-head check on ACK arrival may never see the stall.
+    fn stall_probe_at_us(&self) -> Option<i64> {
+        if self.fec_tx.is_none() || !self.cfg.tail_probe || !self.sender_arq() || self.snd.in_flight() == 0 || !self.rtt_known() {
+            return None;
+        }
+        let una = self.snd.una;
+        if self.snd.rexmits(una) > 0 || self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) || self.probe_dead == Some(una) {
+            return None; // repaired before: the head probe watches it
+        }
+        Some(self.snd.last_tx_us(una) + self.ack_head_threshold_us(una) + SYN_US)
     }
 
     fn on_ack(&mut self, now_us: i64, ackno: u32, a: &Ack) {
@@ -1284,8 +1371,23 @@ impl Connection {
                 if let Some(t) = self.head_probe_at_us() {
                     if now_us >= t {
                         let s = self.snd.una;
-                        self.snd_loss.insert(s, s);
-                        self.stats.pkt_head_probe += 1;
+                        if self.rexmit_too_late(s, now_us) {
+                            self.probe_dead = Some(s);
+                        } else {
+                            self.snd_loss.insert(s, s);
+                            self.stats.pkt_head_probe += 1;
+                        }
+                    }
+                }
+                if let Some(t) = self.stall_probe_at_us() {
+                    if now_us >= t {
+                        let s = self.snd.una;
+                        if self.rexmit_too_late(s, now_us) {
+                            self.probe_dead = Some(s);
+                        } else {
+                            self.snd_loss.insert(s, s);
+                            self.stats.pkt_stall_probe += 1;
+                        }
                     }
                 }
                 self.sender_drop(now_us);
@@ -1300,7 +1402,16 @@ impl Connection {
         let unconfirmed = seq_lt(self.last_ackack_seq, ack);
         // also while holes hold the ACK value, so RTT samples keep coming
         let rtt_probe = !self.rcv_loss.is_empty() && now_us - self.last_ack_us >= ACK_RTT_PROBE_US;
-        if ack != self.last_ack_seq || (unconfirmed && now_us - self.last_ack_us > rto) || rtt_probe {
+        // flow window (libsrt's m_bBufferWasFull, done a little better):
+        // after we advertised little or no room, tell the sender as soon as
+        // the reader frees some, and repeat while it stays small; otherwise
+        // a sender whose window closed (it then sends nothing, so the ACK
+        // value never changes) waits forever
+        let small = self.adv_avail < (self.rcv.capacity() / 4).max(1);
+        if small && (self.rcv.available() > self.adv_avail || now_us - self.last_ack_us > rto) {
+            self.ack_due = Some(AckKind::Full);
+            self.stats.pkt_sent_window_ack += 1;
+        } else if ack != self.last_ack_seq || (unconfirmed && now_us - self.last_ack_us > rto) || rtt_probe {
             self.ack_due = Some(if now_us - self.last_full_ack_us >= SYN_US {
                 AckKind::Full
             } else {
@@ -1345,7 +1456,7 @@ impl Connection {
         let una = self.snd.una;
         // only a packet already repaired at least once (its loss is known;
         // a slow ACK of a packet never reported lost is not a reason)
-        if self.snd.rexmits(una) == 0 || self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) {
+        if self.snd.rexmits(una) == 0 || self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) || self.probe_dead == Some(una) {
             return None;
         }
         Some(self.snd.last_tx_us(una) + self.probe_delay_us())
@@ -1428,6 +1539,9 @@ impl Connection {
                     t = t.min(p);
                 }
                 if let Some(p) = self.head_probe_at_us() {
+                    t = t.min(p);
+                }
+                if let Some(p) = self.stall_probe_at_us() {
                     t = t.min(p);
                 }
                 if let (Some(thr), Some(o)) = (self.snd_drop_threshold_us(), self.snd.oldest_origin_us()) {
@@ -1548,6 +1662,11 @@ impl Connection {
                     self.stats.pkt_rexmit_suppressed += 1;
                     continue;
                 }
+                if self.rexmit_too_late(seq, now_us) {
+                    self.snd_loss.pop();
+                    self.stats.pkt_rexmit_too_late += 1;
+                    continue;
+                }
                 if !self.pacer.ready(now_us * 1000) {
                     return None;
                 }
@@ -1599,6 +1718,16 @@ impl Connection {
             return Some(n);
         }
         None
+    }
+
+    /// A retransmission of `seq` sent now would reach a TSBPD receiver
+    /// after its play time (it plays a packet at origin + latency + the
+    /// one-way delay; the copy arrives at now + the one-way delay): skip it.
+    fn rexmit_too_late(&self, seq: u32, now_us: i64) -> bool {
+        if self.snd_latency_ms == 0 || self.peer_flags & flags::TSBPDRCV == 0 {
+            return false;
+        }
+        now_us > self.snd.origin_us(seq) + self.snd_latency_ms as i64 * 1000
     }
 
     /// Too little time left before the receiver plays `seq` for another
@@ -1709,6 +1838,7 @@ impl Connection {
             a.bandwidth = self.pkt_rate;
             a.byte_rate = self.byte_rate;
         }
+        self.adv_avail = a.avail_buf;
         self.ack_window[self.ackno as usize % ACK_WINDOW] = AckRec {
             ackno: self.ackno,
             seq,
