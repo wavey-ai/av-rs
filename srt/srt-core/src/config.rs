@@ -100,6 +100,26 @@ pub struct Config {
     /// yields a second repair. The RTT itself is reported unchanged. Not an
     /// SRT option.
     pub ack_rttvar_floor: bool,
+    /// The too-late skip, last-chance copy and probe deadline of a
+    /// retransmission follow the receiver's give-up of a hole: when the
+    /// next packet after it is due (the later of its own and the next
+    /// packet's origin + latency), not its own origin + latency. Not an
+    /// SRT option (sender timing).
+    pub rexmit_deadline_next: bool,
+    /// Always serve the first request for a packet never retransmitted
+    /// (its original's send time does not suppress it; libsrt does the
+    /// same); later requests keep the suppression window of the last copy.
+    /// A libsrt FEC `onreq` receiver NAKs a loss once, and under jitter that
+    /// NAK can come sooner than SRTT - RTTVar after the original:
+    /// suppressing it lost the packet (bench: srt-rs FEC -> libsrt FEC, 166
+    /// Mbit/s, 1 %, jitter 5 ms: 319 -> 53 frames lost, n = 3; libsrt ->
+    /// libsrt 199). Not an SRT option.
+    pub rexmit_first_always: bool,
+    /// Suppress a requested retransmission as libsrt's RETRANSMITALGO=1:
+    /// only within SRTT - 4 RTTVar of the last *retransmission* (the first
+    /// request is always served), instead of within max(SRTT - RTTVar,
+    /// SRTT / 2) of the last copy, original included. Not an SRT option.
+    pub rexmit_suppress_libsrt: bool,
     /// When the pacer holds packets back, wake this long after the next
     /// packet is allowed, so each wake-up sends a batch (the pacer's 1 ms
     /// burst allowance keeps the rate). Not an SRT option.
@@ -142,6 +162,9 @@ impl Default for Config {
             repair_copies: true,
             probe_ack_lag: true,
             ack_rttvar_floor: true,
+            rexmit_deadline_next: true,
+            rexmit_first_always: true,
+            rexmit_suppress_libsrt: false,
             pace_quantum_us: 250,
             fec_ack_head_delay_us: -1,
         }

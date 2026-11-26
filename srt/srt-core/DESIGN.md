@@ -268,8 +268,9 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   Sim: a peer ACKing ~20 ms after the newest packet, RTT 2 ms, 96 frames:
   96 tail probes before, 2 after; a lost tail is still repaired in time.
 - The hold-off part of the wait never pushes a probe past the last moment
-  its copy can still be played (origin + the peer's latency - 1 ms, as
-  `rexmit_too_late`); the probe never comes before one ACK period of wait.
+  its copy can still be played (the receiver's give-up of the hole - 1
+  ms, as `rexmit_too_late`); the probe never comes before one ACK period
+  of wait.
 
 ## Reordering with LOSSMAXTTL 0 (rs2)
 
@@ -317,6 +318,29 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
 - Hole deadlines (re-NAK stop and spread) are kept without the TSBPD moves
   made so far and get the current `Tsbpd::moved_us` (settle, drift; not the
   wrap carry) added when used, so they follow later base moves.
+
+## Retransmission toward a libsrt receiver under jitter (review A2)
+
+- Suppression: a request within max(SRTT - RTTVar, SRTT / 2) of a
+  packet's last copy is not served (the request crossed the copy). The
+  first request for a packet never retransmitted is now always served
+  (`rexmit_first_always`, default on; libsrt's RETRANSMITALGO=1 does the
+  same): the original's send time no longer suppresses it. A libsrt FEC
+  `onreq` receiver NAKs a loss once, when its group closes; with 5 ms
+  jitter that NAK often came sooner than the window after the original,
+  was suppressed and never repeated. Bench, srt-rs -> libsrt, RTT 30,
+  1 %, jitter 5 ms, n = 3 (frames lost+late per run): FEC 166 Mbit/s
+  319 -> 53 (libsrt -> libsrt 199), FEC 25 13 -> 1 (12.3), plain 166
+  3.7 -> 0 (0.3); srt-rs -> srt-rs 0 either way, retransmissions there
+  +0 % plain, +20 % FEC. `rexmit_suppress_libsrt` (off) is libsrt's whole
+  rule (window SRTT - 4 RTTVar after the last retransmission): the same
+  losses, 1.4-2.8x the retransmissions.
+- Too-late skip, last-chance copy and probe cap follow the receiver's
+  give-up of a hole: a TSBPD receiver (libsrt's and ours) drops a hole
+  when the next packet it has is due, so the deadline is the later of the
+  packet's and the next packet's origin + latency; none while nothing
+  after it is held (`rexmit_deadline_next`, default on). No measurable
+  effect in the same A/B (n = 3); kept as the correct model.
 
 ## Range validation (review A2)
 

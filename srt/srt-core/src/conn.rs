@@ -1463,7 +1463,8 @@ impl Connection {
         if self.snd_latency_ms == 0 || self.peer_flags & flags::TSBPDRCV == 0 {
             return at;
         }
-        let last = self.snd.origin_us(seq) + self.snd_latency_ms as i64 * 1000 - PROBE_MARGIN_US;
+        let Some(o) = self.deadline_origin_us(seq) else { return at };
+        let last = o + self.snd_latency_ms as i64 * 1000 - PROBE_MARGIN_US;
         at.min(last.max(min_at))
     }
 
@@ -1684,13 +1685,32 @@ impl Connection {
     }
 
     /// Do not retransmit a packet (re)sent less than this long ago: the
-    /// request was sent before the previous copy could have arrived.
+    /// request was sent before the previous copy could have arrived. With
+    /// `rexmit_suppress_libsrt`, libsrt's RETRANSMITALGO=1 window instead:
+    /// SRTT - 4 RTTVar after the last retransmission (0 or less: none).
     fn rexmit_suppress_us(&self) -> i64 {
         if !self.rtt_known() {
             return 0;
         }
         let (r, v) = (self.srtt as i64, self.rttvar as i64);
+        if self.cfg.rexmit_suppress_libsrt {
+            return r - 4 * v;
+        }
         (r - v).max(r / 2)
+    }
+
+    /// A request for `seq` falls within the suppression window of its last
+    /// copy. With `rexmit_first_always` (or `rexmit_suppress_libsrt`) only
+    /// a retransmitted copy counts, as libsrt: the first request for a
+    /// packet is always served (a receiver that NAKs a loss once, as
+    /// libsrt's FEC `onreq` does, may send it sooner than an RTT after the
+    /// original under jitter; suppressing it loses the packet).
+    #[inline]
+    fn suppressed(&self, seq: u32, now_us: i64, window_us: i64) -> bool {
+        if (self.cfg.rexmit_first_always || self.cfg.rexmit_suppress_libsrt) && self.snd.rexmits(seq) == 0 {
+            return false;
+        }
+        now_us - self.snd.last_tx_us(seq) < window_us
     }
 
     /// The earliest time `handle_timeout` should run, or a message becomes
@@ -1851,7 +1871,7 @@ impl Connection {
                     }
                     continue;
                 }
-                if now_us - self.snd.last_tx_us(seq) < suppress {
+                if self.suppressed(seq, now_us, suppress) {
                     self.snd_loss.pop();
                     self.stats.pkt_rexmit_suppressed += 1;
                     continue;
@@ -1920,14 +1940,30 @@ impl Connection {
         None
     }
 
+    /// The origin time the receiver's give-up of a missing `seq` follows:
+    /// a TSBPD receiver (libsrt's and ours) drops a hole only when the next
+    /// packet it has is due, so not before `seq + 1`'s play time. With
+    /// `rexmit_deadline_next`, the later of `seq`'s and `seq + 1`'s origin
+    /// (None when nothing after `seq` is held: no receiver can give it up
+    /// yet; the sender drop still bounds it); else `seq`'s own.
+    fn deadline_origin_us(&self, seq: u32) -> Option<i64> {
+        let o = self.snd.origin_us(seq);
+        if !self.cfg.rexmit_deadline_next {
+            return Some(o);
+        }
+        let n = seq_inc(seq);
+        self.snd.holds(n).then(|| o.max(self.snd.origin_us(n)))
+    }
+
     /// A retransmission of `seq` sent now would reach a TSBPD receiver
-    /// after its play time (it plays a packet at origin + latency + the
-    /// one-way delay; the copy arrives at now + the one-way delay): skip it.
+    /// after it gave the packet up (it plays a packet at origin + latency +
+    /// the one-way delay, and drops a hole when the next packet is due; the
+    /// copy arrives at now + the one-way delay): skip it.
     fn rexmit_too_late(&self, seq: u32, now_us: i64) -> bool {
         if self.snd_latency_ms == 0 || self.peer_flags & flags::TSBPDRCV == 0 {
             return false;
         }
-        now_us > self.snd.origin_us(seq) + self.snd_latency_ms as i64 * 1000
+        self.deadline_origin_us(seq).map_or(false, |o| now_us > o + self.snd_latency_ms as i64 * 1000)
     }
 
     /// Too little time left before the receiver plays `seq` for another
@@ -1936,7 +1972,8 @@ impl Connection {
         if !self.rtt_known() || self.snd_latency_ms == 0 {
             return false;
         }
-        let left = self.snd.origin_us(seq) + self.snd_latency_ms as i64 * 1000 - now_us;
+        let Some(o) = self.deadline_origin_us(seq) else { return false };
+        let left = o + self.snd_latency_ms as i64 * 1000 - now_us;
         let r = self.srtt as i64;
         let round = 3 * r / 2 + (4 * self.rttvar as i64).min(r / 2) + LAST_CHANCE_MARGIN_US;
         left < round
@@ -2206,37 +2243,93 @@ mod tests {
 
     /// Review A2 item 5: the measured ACK hold-off part of a probe's wait
     /// never pushes it past the last moment its copy can still be played
-    /// (origin + the peer's latency - 1 ms); it never goes below one ACK
-    /// period either.
+    /// (the receiver's give-up of the hole - 1 ms); it never goes below one
+    /// ACK period either.
     #[test]
     fn probe_wait_is_capped_by_the_packet_deadline() {
-        let (mut c, _p, t0) = pair(60);
-        c.srtt = 24_000;
-        c.rttvar = 6_000;
-        c.rtt_valid = true;
-        c.holdoff_cur_us = 40_000; // capped at L / 2 = 30 ms
-        let now = t0 + Duration::from_millis(100);
-        let now_us = c.us(now);
-        c.send_message(now, &[1; 100], None).unwrap();
-        let mut buf = [0u8; 1500];
-        while c.poll_transmit(now, &mut buf).is_some() {}
-        let seq = seq_dec(c.snd.next_send);
-        // RTT 24 + RTTVar term 12 + hold-off 30 + 1 = 67 ms: past origin + 60
-        assert_eq!(c.probe_delay_us(), 67_000);
-        assert_eq!(c.probe_at_us(), Some(now_us + 59_000), "tail probe");
-        c.snd.count_rexmit(seq);
-        assert_eq!(c.head_probe_at_us(), Some(now_us + 59_000), "head probe");
-        // a short hold-off is not cut
-        c.holdoff_cur_us = 5_000;
-        assert_eq!(c.probe_at_us(), Some(now_us + 47_000));
-        // the cap never goes below one ACK period of wait
-        c.holdoff_cur_us = 40_000;
-        c.srtt = 50_000;
-        c.rttvar = 1_000;
-        assert_eq!(c.probe_at_us(), Some(now_us + 50_000 + 4_000 + 10_000 + 1_000));
-        // without TSBPD at the peer there is no deadline
-        c.peer_flags &= !flags::TSBPDRCV;
-        assert_eq!(c.probe_at_us(), Some(now_us + 50_000 + 4_000 + 30_000 + 1_000));
+        for next in [true, false] {
+            let (mut c, _p, t0) = pair(60);
+            c.cfg.rexmit_deadline_next = next;
+            c.srtt = 24_000;
+            c.rttvar = 6_000;
+            c.rtt_valid = true;
+            c.holdoff_cur_us = 40_000; // capped at L / 2 = 30 ms
+            let now = t0 + Duration::from_millis(100);
+            let now_us = c.us(now);
+            let mut buf = [0u8; 1500];
+            c.send_message(now, &[1; 100], None).unwrap();
+            while c.poll_transmit(now, &mut buf).is_some() {}
+            // RTT 24 + RTTVar term 12 + hold-off 30 + 1 = 67 ms: past origin + 60
+            assert_eq!(c.probe_delay_us(), 67_000);
+            // the newest packet: with `next`, no receiver can give it up before
+            // a later packet exists (no cap); else its own origin + L - 1 ms
+            let tail = if next { now_us + 67_000 } else { now_us + 59_000 };
+            assert_eq!(c.probe_at_us(), Some(tail), "tail probe, next {next}");
+            // a second packet 2 ms later: the head's give-up follows it with `next`
+            let later = now + Duration::from_millis(2);
+            c.send_message(later, &[2; 100], None).unwrap();
+            while c.poll_transmit(later, &mut buf).is_some() {}
+            let una = c.snd.una;
+            c.snd.count_rexmit(una);
+            let head = if next { now_us + 2_000 + 59_000 } else { now_us + 59_000 };
+            assert_eq!(c.head_probe_at_us(), Some(head), "head probe, next {next}");
+            // a short hold-off is not cut
+            c.holdoff_cur_us = 5_000;
+            assert_eq!(c.head_probe_at_us(), Some(now_us + 47_000));
+            // the cap never goes below one ACK period of wait
+            c.holdoff_cur_us = 40_000;
+            c.srtt = 50_000;
+            c.rttvar = 1_000;
+            assert_eq!(c.head_probe_at_us(), Some(now_us + 50_000 + 4_000 + 10_000 + 1_000));
+            // without TSBPD at the peer there is no deadline
+            c.peer_flags &= !flags::TSBPDRCV;
+            assert_eq!(c.head_probe_at_us(), Some(now_us + 50_000 + 4_000 + 30_000 + 1_000));
+        }
+    }
+
+    /// Review A2 item 3: a libsrt FEC (`onreq`) receiver NAKs a loss once,
+    /// when its group closes; under jitter that NAK can come sooner than
+    /// the suppression window after the original. The first request for a
+    /// packet never retransmitted is always served (`rexmit_first_always`,
+    /// libsrt's rule); a repeat within the window of the last copy is not.
+    #[test]
+    fn first_request_is_served_even_soon_after_the_original() {
+        for first_always in [true, false] {
+            let (mut c, _p, t0) = pair(120);
+            c.cfg.rexmit_first_always = first_always;
+            c.srtt = 30_000;
+            c.rttvar = 3_000;
+            c.rtt_valid = true;
+            let now = t0 + Duration::from_millis(100);
+            let mut buf = [0u8; 1500];
+            for i in 0..3u8 {
+                c.send_message(now, &[i; 100], None).unwrap();
+            }
+            while c.poll_transmit(now, &mut buf).is_some() {}
+            let seq = c.snd.una;
+            let nak = |c: &mut Connection, at: Instant, buf: &mut [u8; 1500]| {
+                let mut b = [0u8; 64];
+                let n = packet::encode_nak([(seq, seq)], 0, c.local_sid, 10, &mut b);
+                let peer = c.peer;
+                c.handle_datagram(at, peer, &b[..n]);
+                let mut sent = 0;
+                while c.poll_transmit(at, buf).is_some() {
+                    sent += 1;
+                }
+                sent
+            };
+            // 10 ms after the original (window max(SRTT - RTTVar, SRTT / 2) = 27 ms)
+            let t1 = now + Duration::from_millis(10);
+            let sent = nak(&mut c, t1, &mut buf);
+            assert_eq!((sent, c.stats.pkt_retrans), if first_always { (1, 1) } else { (0, 0) }, "first_always {first_always}");
+            // a repeat 5 ms after that copy is suppressed either way
+            let t2 = t1 + Duration::from_millis(5);
+            let before = c.stats.pkt_retrans;
+            nak(&mut c, t2, &mut buf);
+            if first_always {
+                assert_eq!(c.stats.pkt_retrans, before);
+            }
+        }
     }
 
     /// Review A2 item 6: a hole's deadline follows TSBPD base moves made
