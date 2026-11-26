@@ -26,6 +26,10 @@ pub struct SrtSocket {
     pub recv_datagrams: u64,
     /// The socket may hold unread datagrams (edge-triggered readiness).
     may_read: bool,
+    /// The last read stopped at MAX_RECV_PER_DRIVE with datagrams left:
+    /// `poll_timeout` returns this (past) time so the next drive comes at
+    /// once (no new readiness edge will come for them).
+    read_backlog: Option<Instant>,
 }
 
 pub(crate) fn udp_socket(bind: SocketAddr, opts: &UdpOptions) -> io::Result<(std::net::UdpSocket, (usize, usize))> {
@@ -69,6 +73,7 @@ impl SrtSocket {
             recv_calls: 0,
             recv_datagrams: 0,
             may_read: true,
+            read_backlog: None,
         };
         me.flush(now)?;
         Ok(me)
@@ -174,6 +179,7 @@ impl SrtSocket {
         if total == 0 {
             self.may_read = false;
         }
+        self.read_backlog = self.may_read.then_some(now);
         Ok(())
     }
 
@@ -213,9 +219,13 @@ impl SrtSocket {
         n
     }
 
-    /// When the next `drive` is needed (timers, pacing, delivery).
+    /// When the next `drive` is needed (timers, pacing, delivery; at once
+    /// when the last read left datagrams in the socket).
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.conn.poll_timeout()
+        match (self.conn.poll_timeout(), self.read_backlog) {
+            (Some(t), Some(b)) => Some(t.min(b)),
+            (t, b) => t.or(b),
+        }
     }
 
     /// Datagrams queued in the batch because the socket would block.

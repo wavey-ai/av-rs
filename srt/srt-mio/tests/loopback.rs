@@ -275,3 +275,56 @@ fn read_coalescing_with_a_packet_paced_sender() {
     assert!(late <= total / 100, "late {late}");
     assert!(l.coalesce_pauses > 0);
 }
+
+/// Review A2: a fixed-port listener does not set SO_REUSEADDR by default
+/// (libsrt never does): another socket cannot bind the same port, even one
+/// that asks for SO_REUSEADDR itself. With `reuse_address` it can.
+#[test]
+fn fixed_port_bind_has_no_reuseaddr_by_default() {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let cfg = Config::default();
+    let l = SrtListener::bind("127.0.0.1:0".parse().unwrap(), cfg.clone(), &UdpOptions::default()).unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    // the same port, now fixed
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let l = SrtListener::bind(addr, cfg.clone(), &UdpOptions::default()).unwrap();
+    let other = |reuse: bool| {
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        s.set_reuse_address(reuse).unwrap();
+        s.bind(&addr.into())
+    };
+    assert!(other(true).is_err(), "a second bind with SO_REUSEADDR succeeded");
+    drop(l);
+    let opts = UdpOptions { reuse_address: true, ..UdpOptions::default() };
+    let _l = SrtListener::bind(addr, cfg, &opts).unwrap();
+    assert!(other(true).is_ok(), "reuse_address: true should allow it");
+}
+
+/// Review A2: datagrams left in the socket after MAX_RECV_PER_DRIVE (1024)
+/// are read on the next drive at once: `poll_timeout` says so (no new
+/// readiness edge comes for them).
+#[test]
+fn listener_reads_the_rest_without_waiting_for_a_timer() {
+    let cfg = Config::default();
+    let mut l = SrtListener::bind("127.0.0.1:0".parse().unwrap(), cfg, &UdpOptions::default()).unwrap();
+    let laddr = l.local_addr().unwrap();
+    let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    // control packets (ACK) for an unknown socket id: counted, ignored
+    let mut d = [0u8; 44];
+    d[0] = 0x80;
+    d[1] = 0x02;
+    d[12..16].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+    for _ in 0..1500 {
+        tx.send_to(&d, laddr).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let now = Instant::now();
+    l.drive(now).unwrap();
+    assert_eq!(l.unknown_dst, 1024);
+    assert!(l.poll_timeout().map_or(false, |t| t <= now), "{:?}", l.poll_timeout());
+    let now2 = Instant::now();
+    l.drive_io(now2).unwrap();
+    assert_eq!(l.unknown_dst, 1500);
+    assert!(l.poll_timeout().map_or(true, |t| t > now2));
+}

@@ -32,7 +32,9 @@ pub struct UdpOptions {
     pub recv_buffer: Option<usize>,
     /// SO_SNDBUF request.
     pub send_buffer: Option<usize>,
-    /// SO_REUSEADDR, applied only when binding a fixed port (never to an
+    /// SO_REUSEADDR, off by default (libsrt never sets it): with it, a
+    /// second process can bind the same fixed UDP port and take some of
+    /// the datagrams. Applied only when binding a fixed port (never to an
     /// ephemeral port-0 bind, where it lets Linux reuse a port in use).
     pub reuse_address: bool,
 }
@@ -42,7 +44,7 @@ impl Default for UdpOptions {
         UdpOptions {
             recv_buffer: Some(32 << 20),
             send_buffer: Some(32 << 20),
-            reuse_address: true,
+            reuse_address: false,
         }
     }
 }
