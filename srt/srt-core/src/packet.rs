@@ -440,6 +440,7 @@ pub fn encode_ack(ack: &Ack, ackno: u32, timestamp: u32, dst: u32, b: &mut [u8])
 /// NAK to maxPayload/4). Returns the length (0 if there was nothing to send).
 pub fn encode_nak<I: IntoIterator<Item = (u32, u32)>>(ranges: I, timestamp: u32, dst: u32, max_words: usize, b: &mut [u8]) -> usize {
     ControlHeader::new(ctrl::NAK, 0, timestamp, dst).encode(b);
+    let max_words = max_words.min(b.len().saturating_sub(HDR_LEN) / 4);
     let mut off = HDR_LEN;
     let mut words = 0;
     for (first, last) in ranges {
@@ -474,10 +475,14 @@ pub fn encode_dropreq(msgno: u32, first: u32, last: u32, timestamp: u32, dst: u3
     HDR_LEN + 8
 }
 
-/// HANDSHAKE control packet; returns the length.
-pub fn encode_handshake(hs: &Handshake, timestamp: u32, dst: u32, b: &mut [u8]) -> usize {
+/// HANDSHAKE control packet; returns the length, or `None` if it does not
+/// fit in `b`.
+pub fn encode_handshake(hs: &Handshake, timestamp: u32, dst: u32, b: &mut [u8]) -> Option<usize> {
+    if b.len() < HDR_LEN + hs.encoded_len() {
+        return None;
+    }
     ControlHeader::new(ctrl::HANDSHAKE, 0, timestamp, dst).encode(b);
-    HDR_LEN + hs.encode(&mut b[HDR_LEN..])
+    hs.encode(&mut b[HDR_LEN..]).map(|n| HDR_LEN + n)
 }
 
 #[cfg(test)]

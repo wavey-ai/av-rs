@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::fec::{ArqLevel, FecConfig, FecRx, FecTx};
 use crate::handshake::{flags, ip_to_words, req, Handshake, RejectReason, SrtHsExt, HS_MAGIC, SRT_VERSION, UDT_DGRAM};
 use crate::losslist::{Hole, RcvLossList, SndLossList, NEVER};
-use crate::packet::{self, rd32, Ack, AckKind, Control, DataHeader, LossList, Packet, HDR_LEN, PKT_OVERHEAD};
+use crate::packet::{self, rd32, Ack, AckKind, Control, DataHeader, LossList, Packet, HDR_LEN, MAX_DATAGRAM, PKT_OVERHEAD};
 use crate::rcvbuf::{Insert, RcvBuf};
 use crate::seq::{ackno_inc, seq_dec, seq_inc, seq_le, seq_lt, seq_off};
 use crate::sndbuf::{Pacer, SndBuf};
@@ -304,6 +304,12 @@ fn our_flags(cfg: &Config) -> u32 {
         f &= !(flags::TSBPDSND | flags::TSBPDRCV);
     }
     f
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        crate::config::wipe_passphrase(&mut self.cfg.passphrase);
+    }
 }
 
 impl Connection {
@@ -687,6 +693,11 @@ impl Connection {
             self.stats.pkt_recv_wrong_peer += 1;
             return;
         }
+        if data.len() > MAX_DATAGRAM {
+            // libsrt's receive unit is the MSS: it never sees longer ones
+            self.stats.pkt_recv_malformed += 1;
+            return;
+        }
         if self.is_closed() {
             return;
         }
@@ -892,7 +903,8 @@ impl Connection {
     }
 
     /// A KMREQ while connected: the peer's sender announces (or switches
-    /// to) new keys. Answer with KMRSP: the same message, or our KM state.
+    /// to) new keys. Answer with KMRSP: the same message (exactly one KM
+    /// message: `refresh` refuses any other length), or our KM state.
     #[cfg(feature = "aes")]
     fn on_kmreq(&mut self, km: &[u8]) {
         use crate::crypto::km_state;
@@ -965,6 +977,13 @@ impl Connection {
             if self.fec_rx.is_some() {
                 self.on_fec_packet(now_us, hdr, payload);
             }
+            return;
+        }
+        #[cfg(feature = "aes")]
+        if hdr.key == 0 && self.crypto.is_some() {
+            // as libsrt: "unencrypted packets are not allowed" once keys
+            // are set; count it and drop it (never delivered)
+            st.pkt_rcv_undecrypt += 1;
             return;
         }
         #[cfg(feature = "aes")]
@@ -1149,13 +1168,19 @@ impl Connection {
             let mut dec = std::mem::take(&mut self.dec_buf);
             #[cfg(feature = "aes")]
             let plain: &[u8] = match (&self.crypto, r.flags & 3) {
-                (Some(c), k) if k != 0 => {
+                (Some(c), k) => {
                     dec.clear();
                     dec.extend_from_slice(rx.rebuilt(&r));
-                    c.decrypt(k, r.seq, &mut dec);
+                    // KK = 0 in an encrypted session, or an unknown key:
+                    // dropped as on the data path
+                    if k == 0 || !c.decrypt(k, r.seq, &mut dec) {
+                        self.stats.pkt_rcv_undecrypt += 1;
+                        self.dec_buf = dec;
+                        continue;
+                    }
                     &dec
                 }
-                _ => rx.rebuilt(&r),
+                (None, _) => rx.rebuilt(&r),
             };
             #[cfg(not(feature = "aes"))]
             let plain: &[u8] = rx.rebuilt(&r);
@@ -1738,8 +1763,12 @@ impl Connection {
 
     // ------------------------------------------------------------ output
 
-    /// Write the next datagram to send into `buf` (>= 1500 bytes).
+    /// Write the next datagram to send into `buf` (>= 1500 bytes; `None`
+    /// for a shorter one).
     pub fn poll_transmit(&mut self, now: Instant, buf: &mut [u8]) -> Option<Transmit> {
+        if buf.len() < MAX_DATAGRAM {
+            return None;
+        }
         let now_us = self.us(now);
         let ts = now_us as u64 as u32;
         let len = self.next_datagram(now_us, ts, buf)?;
@@ -1758,8 +1787,18 @@ impl Connection {
             let hs = self.hs.as_ref()?;
             self.hs_sent_us = now_us;
             self.hs_sends += 1;
-            self.stats.pkt_sent_handshake += 1;
-            return Some(packet::encode_handshake(hs, ts, self.hs_dst, buf));
+            match packet::encode_handshake(hs, ts, self.hs_dst, buf) {
+                Some(n) => {
+                    self.stats.pkt_sent_handshake += 1;
+                    return Some(n);
+                }
+                None => {
+                    // cannot happen with validated settings and an exact
+                    // KM message; never panic on it
+                    self.set_closed(CloseReason::Rejected(RejectReason::Ipe));
+                    return None;
+                }
+            }
         }
         if self.state != State::Connected {
             return None;
@@ -1808,9 +1847,12 @@ impl Connection {
         if let Some(km) = self.km_out.take() {
             let mut h = packet::ControlHeader::new(packet::ctrl::EXT, 0, ts, self.peer_sid);
             h.subtype = crate::handshake::cmd::KMRSP;
-            h.encode(buf);
-            buf[HDR_LEN..HDR_LEN + km.len()].copy_from_slice(&km);
-            return Some(HDR_LEN + km.len());
+            // `refresh` takes exactly one KM message; check anyway
+            if HDR_LEN + km.len() <= buf.len() {
+                h.encode(buf);
+                buf[HDR_LEN..HDR_LEN + km.len()].copy_from_slice(&km);
+                return Some(HDR_LEN + km.len());
+            }
         }
         // retransmissions first: they are older than any new packet, so
         // their deadline is earlier (spec 12 #6); same pacer

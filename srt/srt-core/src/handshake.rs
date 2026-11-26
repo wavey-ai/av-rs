@@ -305,8 +305,12 @@ impl Handshake {
 
     /// Encode the CIF (48 bytes + blocks: HSREQ/HSRSP, KMREQ/KMRSP when
     /// `km_req`/`km_rsp` hold data, SID, CONGESTION, FILTER). GROUP is
-    /// never emitted. Returns the length.
-    pub fn encode(&self, b: &mut [u8]) -> usize {
+    /// never emitted. Returns the length, or `None` (nothing written) if
+    /// `b` is shorter than `encoded_len()`.
+    pub fn encode(&self, b: &mut [u8]) -> Option<usize> {
+        if self.encoded_len() > b.len() {
+            return None;
+        }
         wr32(b, 0, self.version);
         wr32(b, 4, ((self.encryption as u32) << 16) | self.ext_field as u32);
         wr32(b, 8, self.isn);
@@ -345,7 +349,7 @@ impl Handshake {
                 off += 4 + words * 4;
             }
         }
-        off
+        Some(off)
     }
 
     /// Decode a handshake CIF; `None` if shorter than 48 bytes. Blocks
@@ -474,7 +478,7 @@ mod tests {
         };
         assert_eq!(hs.conclusion_ext_flags(), 5);
         let mut b = [0u8; 256];
-        let n = hs.encode(&mut b);
+        let n = hs.encode(&mut b).unwrap();
         assert_eq!(n, hs.encoded_len());
         assert_eq!(Handshake::decode(&b[..n]).unwrap(), hs);
         // truncated block: parsing stops, the 48 bytes still decode
@@ -504,10 +508,34 @@ mod tests {
         };
         assert_eq!(hs.conclusion_ext_flags(), ext::HSREQ | ext::KMREQ | ext::CONFIG);
         let mut b = [0u8; 256];
-        let n = hs.encode(&mut b);
+        let n = hs.encode(&mut b).unwrap();
         assert_eq!(n, hs.encoded_len());
         // the KM bytes appear on the wire unchanged after their block header
         assert_eq!(&b[48 + 16 + 4..48 + 16 + 4 + 56], &km[..]);
         assert_eq!(Handshake::decode(&b[..n]).unwrap(), hs);
+    }
+
+    #[test]
+    fn encode_refuses_a_short_buffer() {
+        // a KM block too large for one datagram: no panic, nothing written
+        let hs = Handshake {
+            version: 5,
+            req_type: req::CONCLUSION,
+            km_rsp: Some(vec![0xAA; 1500]),
+            stream_id: Some("x".repeat(512)),
+            ..Default::default()
+        };
+        let mut b = [0x11u8; 1484];
+        assert!(hs.encoded_len() > b.len());
+        assert_eq!(hs.encode(&mut b), None);
+        assert!(b.iter().all(|x| *x == 0x11));
+        let mut p = [0u8; crate::packet::MAX_DATAGRAM];
+        assert_eq!(crate::packet::encode_handshake(&hs, 0, 0, &mut p), None);
+        assert_eq!(crate::packet::encode_handshake(&hs, 0, 0, &mut p[..10]), None);
+        // exactly enough room is fine
+        let small = Handshake { km_rsp: Some(vec![1; 40]), ..hs.clone() };
+        let mut exact = vec![0u8; small.encoded_len()];
+        assert_eq!(small.encode(&mut exact), Some(small.encoded_len()));
+        assert_eq!(small.encode(&mut exact[..small.encoded_len() - 1]), None);
     }
 }

@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::conn::{Connection, Negotiated};
 use crate::handshake::{flags, req, Handshake, RejectReason, HS_MAGIC, MAX_SID_LEN, SRT_MIN_VERSION};
-use crate::packet::{self, Control, Packet, PKT_OVERHEAD};
+use crate::packet::{self, Control, Packet, MAX_DATAGRAM, PKT_OVERHEAD};
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -140,11 +140,18 @@ fn key_exchange(hs: &Handshake, secret: Option<&str>) -> Result<Option<Box<crate
         (None, None) => Ok(None),
         (Some(km), Some(p)) => match Crypto::from_km(p, km) {
             Ok(c) => Ok(Some(Box::new(c))),
-            Err(KmError::BadSecret) => Err(RejectReason::BadSecret),
-            Err(_) => Err(RejectReason::Unsecure),
+            // libsrt: a KM it cannot parse leaves the BADSECRET state
+            Err(KmError::BadSecret | KmError::Malformed) => Err(RejectReason::BadSecret),
+            Err(KmError::NoSecret) => Err(RejectReason::Unsecure),
         },
         // only one side encrypts
         _ => Err(RejectReason::Unsecure),
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        crate::config::wipe_passphrase(&mut self.cfg.passphrase);
     }
 }
 
@@ -235,12 +242,21 @@ impl Listener {
             peer_ip: hs.peer_ip,
             ..Default::default()
         };
-        ListenerAction::Reply(packet::encode_handshake(&r, self.ts(now), hs.socket_id, out))
+        Self::reply(packet::encode_handshake(&r, self.ts(now), hs.socket_id, out))
+    }
+
+    fn reply(len: Option<usize>) -> ListenerAction {
+        len.map_or(ListenerAction::Ignore, ListenerAction::Reply)
     }
 
     /// Handle one datagram addressed to socket ID 0. `out` (>= 1500 bytes)
     /// receives a reply for `Reply`.
     pub fn handle(&mut self, now: Instant, from: SocketAddr, data: &[u8], out: &mut [u8]) -> ListenerAction {
+        // libsrt never sees datagrams longer than its receive unit (MSS)
+        if data.len() > MAX_DATAGRAM || out.len() < MAX_DATAGRAM {
+            self.stats.ignored += 1;
+            return ListenerAction::Ignore;
+        }
         let Ok(Packet::Control {
             hdr,
             body: Control::Handshake(hs),
@@ -266,7 +282,7 @@ impl Listener {
                     peer_ip: hs.peer_ip,
                     ..Default::default()
                 };
-                ListenerAction::Reply(packet::encode_handshake(&r, self.ts(now), hs.socket_id, out))
+                Self::reply(packet::encode_handshake(&r, self.ts(now), hs.socket_id, out))
             }
             req::CONCLUSION => {
                 self.stats.conclusions += 1;
@@ -314,15 +330,18 @@ impl Listener {
                     }
                 }
                 #[cfg(feature = "aes")]
-                match key_exchange(&hs, secret.as_deref()) {
-                    Ok(c) => n.crypto = c,
-                    Err(r) => return self.reject(now, &hs, r, out),
-                }
+                let kx = key_exchange(&hs, secret.as_deref());
                 // without AES a passphrase can never be honoured: refuse
                 // rather than run unencrypted
                 #[cfg(not(feature = "aes"))]
-                if secret.is_some() {
-                    return self.reject(now, &hs, RejectReason::Unsecure, out);
+                let kx: Result<(), RejectReason> = if secret.is_some() { Err(RejectReason::Unsecure) } else { Ok(()) };
+                crate::config::wipe_passphrase(&mut secret);
+                match kx {
+                    #[cfg(feature = "aes")]
+                    Ok(c) => n.crypto = c,
+                    #[cfg(not(feature = "aes"))]
+                    Ok(()) => {}
+                    Err(r) => return self.reject(now, &hs, r, out),
                 }
                 let sid = self.new_sid();
                 let conn = Connection::accepted(self.cfg.clone(), now, from, sid, &hs, hdr.timestamp, n);

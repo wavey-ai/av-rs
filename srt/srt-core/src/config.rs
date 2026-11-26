@@ -5,7 +5,12 @@ use std::time::Duration;
 /// libsrt's "infinite" bandwidth: SRTO_MAXBW -1 paces at 1 Gbit/s.
 pub const BW_INFINITE: i64 = 125_000_000;
 
-#[derive(Clone, Debug)]
+/// Shortest passphrase libsrt accepts (SRTO_PASSPHRASE), bytes.
+pub const PASSPHRASE_MIN: usize = 10;
+/// Longest passphrase libsrt accepts (`HAICRYPT_SECRET_MAX_SZ`), bytes.
+pub const PASSPHRASE_MAX: usize = 80;
+
+#[derive(Clone)]
 pub struct Config {
     /// Our receive latency [SRTO_RCVLATENCY], ms.
     pub rcv_latency_ms: u16,
@@ -87,13 +92,50 @@ pub struct Config {
     /// probe), us; negative = auto (max(latency / 4, 10 ms)). Not an SRT
     /// option.
     pub fec_ack_head_delay_us: i32,
-    /// [SRTO_PASSPHRASE] (10..=79 bytes): encrypt the payload with AES-CTR
+    /// [SRTO_PASSPHRASE] (10..=80 bytes, as libsrt accepts): encrypt the payload with AES-CTR
     /// (needs the `aes` feature; without it a passphrase is refused by
     /// `validate`). A listener's is the default for every caller (see
     /// `Listener::set_accept_secret_callback`).
     pub passphrase: Option<String>,
     /// [SRTO_PBKEYLEN] 0 (16, or what the listener advertises), 16, 24, 32.
     pub pbkeylen: u8,
+}
+
+/// The passphrase is never printed.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("rcv_latency_ms", &self.rcv_latency_ms)
+            .field("peer_latency_ms", &self.peer_latency_ms)
+            .field("payload_size", &self.payload_size)
+            .field("mss", &self.mss)
+            .field("flow_window", &self.flow_window)
+            .field("rcv_buf_pkts", &self.rcv_buf_pkts)
+            .field("snd_buf_pkts", &self.snd_buf_pkts)
+            .field("max_bw", &self.max_bw)
+            .field("input_bw", &self.input_bw)
+            .field("min_input_bw", &self.min_input_bw)
+            .field("overhead_bw_pct", &self.overhead_bw_pct)
+            .field("stream_id", &self.stream_id)
+            .field("packet_filter", &self.packet_filter)
+            .field("fec_nak_cap_us", &self.fec_nak_cap_us)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("peer_idle_timeout", &self.peer_idle_timeout)
+            .field("tsbpd", &self.tsbpd)
+            .field("tlpktdrop", &self.tlpktdrop)
+            .field("snd_drop_delay_ms", &self.snd_drop_delay_ms)
+            .field("drift_tracer", &self.drift_tracer)
+            .field("loss_max_ttl", &self.loss_max_ttl)
+            .field("reorder_window_us", &self.reorder_window_us)
+            .field("tail_probe", &self.tail_probe)
+            .field("repair_copies", &self.repair_copies)
+            .field("ack_rttvar_floor", &self.ack_rttvar_floor)
+            .field("pace_quantum_us", &self.pace_quantum_us)
+            .field("fec_ack_head_delay_us", &self.fec_ack_head_delay_us)
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "<redacted>"))
+            .field("pbkeylen", &self.pbkeylen)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -129,6 +171,18 @@ impl Default for Config {
             passphrase: None,
             pbkeylen: 0,
         }
+    }
+}
+
+/// Overwrite a passphrase with zeros (volatile: not optimised away).
+pub(crate) fn wipe_passphrase(p: &mut Option<String>) {
+    if let Some(p) = p.as_mut() {
+        // SAFETY: zero bytes are valid UTF-8
+        for x in unsafe { p.as_bytes_mut() } {
+            // SAFETY: `x` is a valid, aligned, exclusive reference
+            unsafe { std::ptr::write_volatile(x, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -170,8 +224,8 @@ impl Config {
             return Err("buffers must hold at least 32 packets");
         }
         if let Some(p) = &self.passphrase {
-            if p.len() < 10 || p.len() > 79 {
-                return Err("passphrase must be 10..=79 bytes");
+            if p.len() < PASSPHRASE_MIN || p.len() > PASSPHRASE_MAX {
+                return Err("passphrase must be 10..=80 bytes");
             }
             if !cfg!(feature = "aes") {
                 return Err("a passphrase needs srt-core's `aes` feature");
@@ -194,5 +248,44 @@ impl Config {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_passphrase() {
+        let c = Config {
+            passphrase: Some("very-secret-passphrase".into()),
+            stream_id: Some("sid".into()),
+            ..Config::default()
+        };
+        let d = format!("{c:?}");
+        assert!(!d.contains("very-secret"), "{d}");
+        assert!(d.contains("<redacted>") && d.contains("sid") && d.contains("pbkeylen"), "{d}");
+        assert!(format!("{:?}", Config::default()).contains("passphrase: None"));
+    }
+
+    #[test]
+    fn wipe_passphrase_zeroes() {
+        let mut p = Some("secret-passphrase".to_string());
+        wipe_passphrase(&mut p);
+        assert_eq!(p.as_deref(), Some("\0".repeat(17).as_str()));
+        wipe_passphrase(&mut None);
+    }
+
+    #[test]
+    fn passphrase_length_as_libsrt() {
+        let with = |n: usize| Config {
+            passphrase: Some("p".repeat(n)),
+            ..Config::default()
+        };
+        let ok = cfg!(feature = "aes");
+        assert!(with(9).validate().is_err());
+        assert_eq!(with(10).validate().is_ok(), ok);
+        assert_eq!(with(80).validate().is_ok(), ok);
+        assert!(with(81).validate().is_err());
     }
 }

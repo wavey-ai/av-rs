@@ -114,7 +114,7 @@ fn handshakes_decode_and_reencode_byte_for_byte() {
     for (i, l) in v.iter().take(4).enumerate() {
         let (h, hs) = hs_of(&l.bytes);
         let mut b = [0u8; 1500];
-        let n = packet::encode_handshake(&hs, h.timestamp, h.dst, &mut b);
+        let n = packet::encode_handshake(&hs, h.timestamp, h.dst, &mut b).unwrap();
         assert_eq!(&b[..n], &l.bytes[..], "handshake {i}");
     }
     // rejection 1014 (filter cols:5 vs cols:4)

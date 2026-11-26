@@ -104,6 +104,15 @@ impl Aes {
     }
 }
 
+/// Overwrite secret bytes with zeros (volatile: not optimised away).
+fn wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        // SAFETY: `x` is a valid, aligned, exclusive reference
+        unsafe { std::ptr::write_volatile(x, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 fn kek(passphrase: &[u8], salt: &[u8; SALT_LEN], klen: usize) -> Vec<u8> {
     let mut k = vec![0u8; klen];
     pbkdf2::pbkdf2_hmac::<sha1::Sha1>(passphrase, &salt[SALT_LEN - PBKDF2_SALT_LEN..], PBKDF2_ITER, &mut k);
@@ -157,6 +166,14 @@ pub struct Crypto {
     passphrase: String,
 }
 
+impl Drop for Crypto {
+    fn drop(&mut self) {
+        // SAFETY: zero bytes are valid UTF-8
+        wipe(unsafe { self.passphrase.as_bytes_mut() });
+        wipe(&mut self.km);
+    }
+}
+
 impl fmt::Debug for Crypto {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Crypto").field("klen", &self.klen).field("tx_kk", &self.tx_kk).finish_non_exhaustive()
@@ -170,6 +187,20 @@ struct Km {
     klen: usize,
     even: Option<Vec<u8>>,
     odd: Option<Vec<u8>>,
+}
+
+impl Drop for Km {
+    fn drop(&mut self) {
+        for k in [&mut self.even, &mut self.odd].into_iter().flatten() {
+            wipe(k);
+        }
+    }
+}
+
+/// Length of a KM message with `nkeys` keys of `klen` bytes (libsrt
+/// accepts exactly this length, nothing shorter or longer).
+fn km_len(klen: usize, nkeys: usize) -> usize {
+    KM_HDR + SALT_LEN + klen * nkeys + WRAP_OVERHEAD
 }
 
 fn parse_km(passphrase: &[u8], m: &[u8]) -> Result<Km, KmError> {
@@ -194,18 +225,24 @@ fn parse_km(passphrase: &[u8], m: &[u8]) -> Result<Km, KmError> {
     }
     let nkeys = if kflags == kk::BOTH { 2 } else { 1 };
     let wrapped_at = KM_HDR + SALT_LEN;
-    let wrapped_len = klen * nkeys + WRAP_OVERHEAD;
-    if m.len() < wrapped_at + wrapped_len {
+    // exactly one message: trailing bytes would be echoed in KMRSP
+    if m.len() != km_len(klen, nkeys) {
         return Err(KmError::Malformed);
     }
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&m[KM_HDR..KM_HDR + SALT_LEN]);
-    let k = kek(passphrase, &salt, klen);
-    let keys = unwrap(&k, &m[wrapped_at..wrapped_at + wrapped_len]).ok_or(KmError::BadSecret)?;
+    let mut k = kek(passphrase, &salt, klen);
+    let keys = unwrap(&k, &m[wrapped_at..]);
+    wipe(&mut k);
+    let mut keys = keys.ok_or(KmError::BadSecret)?;
     let (even, odd) = match kflags {
         kk::EVEN => (Some(keys), None),
         kk::ODD => (None, Some(keys)),
-        _ => (Some(keys[..klen].to_vec()), Some(keys[klen..].to_vec())),
+        _ => {
+            let pair = (Some(keys[..klen].to_vec()), Some(keys[klen..].to_vec()));
+            wipe(&mut keys);
+            pair
+        }
     };
     Ok(Km { kflags, salt, klen, even, odd })
 }
@@ -218,7 +255,10 @@ fn build_km(passphrase: &[u8], salt: &[u8; SALT_LEN], kflags: u8, even: Option<&
     if let Some(o) = odd {
         plain.extend_from_slice(o);
     }
-    let wrapped = wrap(&kek(passphrase, salt, klen), &plain).expect("valid key length");
+    let mut k = kek(passphrase, salt, klen);
+    let wrapped = wrap(&k, &plain).expect("valid key length");
+    wipe(&mut k);
+    wipe(&mut plain);
     let mut m = Vec::with_capacity(KM_HDR + SALT_LEN + wrapped.len());
     m.push((KM_VERSION << 4) | KM_PT_KM);
     m.extend_from_slice(&KM_SIGN.to_be_bytes());
@@ -242,10 +282,12 @@ impl Crypto {
         let mut sek = vec![0u8; klen];
         random_bytes(&mut sek);
         let km = build_km(passphrase.as_bytes(), &salt, kk::EVEN, Some(&sek), None, klen);
+        let keys = [Aes::new(&sek), None];
+        wipe(&mut sek);
         Crypto {
             salt,
             klen,
-            keys: [Aes::new(&sek), None],
+            keys,
             km,
             tx_kk: kk::EVEN,
             passphrase: passphrase.to_string(),
@@ -281,6 +323,7 @@ impl Crypto {
             self.keys[1] = Aes::new(o);
         }
         let _ = k.kflags;
+        wipe(&mut self.km);
         self.km = km.to_vec();
         Ok(())
     }
@@ -421,6 +464,40 @@ mod tests {
         assert_eq!(&d, b"payload");
         assert_eq!(Crypto::klen_from_hs_field(4), Some(32));
         assert_eq!(tx.hs_field(), 2);
+    }
+
+    #[test]
+    fn km_must_have_its_exact_length() {
+        for klen in [16, 24, 32] {
+            let tx = Crypto::generate("0123456789", klen);
+            let m = tx.km_msg().to_vec();
+            // trailing junk (would be echoed in KMRSP) and truncation
+            for extra in [1usize, 4, 400, 1600] {
+                let mut long = m.clone();
+                long.extend(std::iter::repeat(0xAA).take(extra));
+                assert_eq!(Crypto::from_km("0123456789", &long).err(), Some(KmError::Malformed), "klen {klen} +{extra}");
+            }
+            for cut in [1usize, 4, 8] {
+                assert_eq!(Crypto::from_km("0123456789", &m[..m.len() - cut]).err(), Some(KmError::Malformed));
+            }
+            // a refresh with junk is refused and changes nothing
+            let mut rx = Crypto::from_km("0123456789", &m).unwrap();
+            let fresh = Crypto::generate("0123456789", klen);
+            let mut long = fresh.km_msg().to_vec();
+            long.extend_from_slice(&[0x55; 12]);
+            assert_eq!(rx.refresh(&long), Err(KmError::Malformed));
+            assert_eq!(rx.km_msg(), &m[..]);
+            rx.refresh(fresh.km_msg()).unwrap();
+            assert_eq!(rx.km_msg(), fresh.km_msg());
+            assert_eq!(rx.km_msg().len(), km_len(klen, 1));
+        }
+    }
+
+    #[test]
+    fn wipe_zeroes() {
+        let mut b = vec![0xA5u8; 33];
+        wipe(&mut b);
+        assert!(b.iter().all(|x| *x == 0));
     }
 
     #[test]
