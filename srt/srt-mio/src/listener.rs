@@ -57,6 +57,10 @@ pub struct SrtListener {
     /// Coalescing pauses taken (`coalesce_delay` returned Some).
     pub coalesce_pauses: u64,
     may_read: bool,
+    /// The last read stopped at MAX_RECV_PER_DRIVE with datagrams left:
+    /// `poll_timeout` returns this (past) time so the next drive comes at
+    /// once (no new readiness edge will come for them).
+    read_backlog: Option<Instant>,
 }
 
 impl SrtListener {
@@ -82,6 +86,7 @@ impl SrtListener {
             last_read: 0,
             coalesce_pauses: 0,
             may_read: true,
+            read_backlog: None,
         })
     }
 
@@ -262,6 +267,7 @@ impl SrtListener {
             }
         }
         self.last_read = total;
+        self.read_backlog = self.may_read.then_some(now);
         Ok(())
     }
 
@@ -269,17 +275,19 @@ impl SrtListener {
     /// sends each packet on its own): after a small read (< `min_batch`
     /// datagrams), wait `delay` before the next poll, so the next
     /// `recvmmsg` takes a batch instead of one wake-up per 1-3 packets.
-    /// `delay` = min(SRTT / 16, `max`) of the first connection with an RTT
-    /// sample; None when that is zero, when a timer is due before it
-    /// ends, or when datagrams are queued to send. The pause delays only
+    /// `delay` = min(SRTT / 16, `max`), SRTT the smallest of the
+    /// connections with an RTT sample (deterministic, and the pause stays
+    /// short for the tightest one); None when that is zero, when a timer is
+    /// due before it ends, when datagrams are queued to send, or when the
+    /// last read left datagrams in the socket. The pause delays only
     /// reading (ACKs and NAKs by <= SRTT / 16); TSBPD delivery and timers
     /// keep their times. Call after `drive_io`, before polling; sleep the
     /// returned duration.
     pub fn coalesce_delay(&mut self, now: Instant, min_batch: usize, max: std::time::Duration) -> Option<std::time::Duration> {
-        if self.last_read == 0 || self.last_read >= min_batch || self.tx.pending() > 0 {
+        if self.last_read == 0 || self.last_read >= min_batch || self.tx.pending() > 0 || self.read_backlog.is_some() {
             return None;
         }
-        let rtt = self.conns.values().map(|s| s.conn.rtt_us()).find(|r| r.1)?.0;
+        let rtt = self.conns.values().map(|s| s.conn.rtt_us()).filter(|r| r.1).map(|r| r.0).min()?;
         let d = std::time::Duration::from_micros(rtt as u64 / 16).min(max);
         if d.is_zero() || self.poll_timeout().map_or(false, |t| t <= now + d) {
             return None;
@@ -334,9 +342,11 @@ impl SrtListener {
                 }
             }
         }
-        // a heap of mostly stale entries is rebuilt from the live deadlines
+        // a heap of mostly stale entries keeps only the live deadlines (in
+        // place: no allocation)
         if self.timers.len() > 64 + 4 * self.conns.len() {
-            self.timers = self.conns.iter().filter_map(|(&id, s)| s.due.map(|t| Reverse((t, id)))).collect();
+            let conns = &self.conns;
+            self.timers.retain(|Reverse((t, id))| conns.get(id).map_or(false, |s| s.due == Some(*t)));
         }
         Ok(())
     }
@@ -355,9 +365,13 @@ impl SrtListener {
 
     /// Earliest timer of any connection: the heap's top (valid after
     /// `drive_io`/`flush`), or now-ish for a connection touched since (dirty
-    /// ones are read directly).
+    /// ones are read directly); the last drive's time when its read left
+    /// datagrams in the socket.
     pub fn poll_timeout(&self) -> Option<Instant> {
         let mut t = self.timers.peek().map(|r| r.0 .0);
+        if let Some(b) = self.read_backlog {
+            t = Some(t.map_or(b, |x| x.min(b)));
+        }
         for id in &self.dirty {
             if let Some(d) = self.conns.get(id).and_then(|s| s.conn.poll_timeout()) {
                 t = Some(t.map_or(d, |x| x.min(d)));

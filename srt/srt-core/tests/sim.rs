@@ -2,6 +2,7 @@
 //! scripted drops), with simulated time.
 
 use srt_core::packet::{self, Control, Packet};
+use srt_core::seq;
 use srt_core::{CloseReason, Config, Connection, Event, Listener, ListenerAction, State};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1692,33 +1693,142 @@ fn fec_row_arq_never_rebuilds_every_single_loss_row() {
     row_fec_check(657, 120, 1.0, true, 0xFEC0_0002);
 }
 
-/// The handshake that sets the receiver's TSBPD base came 12 ms late
-/// (jitter): with `tsbpd_settle_ms` the first data packets move the base
-/// back, so packets play at origin + owd + latency; without it (libsrt's
-/// rule) every packet plays 12 ms late for the whole connection.
+/// One TSBPD timing run: caller -> listener, owd 15 ms, every caller packet
+/// (data, ACKACK, keepalive) delayed by a further ~N(15 ms, 5 ms) (sum of
+/// 12 uniforms, as netem's normal jitter), except the conclusion handshake
+/// that sets the listener's base, which gets `hs_extra`. 10 packets every
+/// 5 ms for `dur`. Returns, per delivered packet, (delivery time - stream
+/// start, its due time - libsrt's handshake rule due time, both µs), and
+/// the listener's stats.
+fn tsbpd_timing_run(settle_ms: u32, hs_extra: Duration, dur: Duration, seed: u64) -> (Vec<(i64, i64)>, srt_core::Stats) {
+    let mut l = cfg(120);
+    l.tsbpd_settle_ms = settle_ms;
+    let mut s = Sim::new(cfg(120), l, 15, 4000);
+    let mut rng = Rng(seed);
+    let hs_ts = std::rc::Rc::new(std::cell::Cell::new(None::<u32>));
+    let hs2 = hs_ts.clone();
+    s.delay = Box::new(move |side, d| {
+        if side != "a" {
+            return Duration::ZERO;
+        }
+        if let Ok(Packet::Control { hdr, body: Control::Handshake(h) }) = packet::decode(d) {
+            if h.req_type == srt_core::handshake::req::CONCLUSION {
+                assert!(hs2.get().is_none(), "one conclusion only (lossless)");
+                hs2.set(Some(hdr.timestamp));
+                return hs_extra;
+            }
+            return Duration::ZERO;
+        }
+        let mut z = -6.0f64;
+        for _ in 0..12 {
+            z += (rng.next() % 1_000_000) as f64 / 1e6;
+        }
+        Duration::from_micros((15_000.0 + 5_000.0 * z).max(0.0) as u64)
+    });
+    let mut accepted_at = None;
+    assert!(s.run_until(Duration::from_secs(5), |s| {
+        if accepted_at.is_none() && !s.accepted.is_empty() {
+            accepted_at = Some(s.now);
+        }
+        s.caller.is_connected()
+    }));
+    let (acc, hs_ts) = (accepted_at.unwrap(), hs_ts.get().unwrap());
+    // libsrt's rule: base = arrival of the handshake - its timestamp
+    let rule = |ts: u32| acc + Duration::from_micros(ts.wrapping_sub(hs_ts) as u64) + Duration::from_millis(120);
+    let mut out = Vec::new();
+    let mut msg = vec![0u8; 1316];
+    let start = s.now;
+    let mut next = start;
+    s.run_until(dur + Duration::from_millis(600), |s| {
+        if s.now - start < dur && s.now >= next {
+            for _ in 0..10 {
+                s.caller.send_message(s.now, &msg, None).unwrap();
+            }
+            msg[0] = msg[0].wrapping_add(1);
+            next += Duration::from_millis(5);
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            let due = m.due.unwrap();
+            let r = rule(m.timestamp);
+            let d = if due >= r { (due - r).as_micros() as i64 } else { -((r - due).as_micros() as i64) };
+            out.push(((now - start).as_micros() as i64, d));
+        }
+        false
+    });
+    let st = s.conn().stats().clone();
+    (out, st)
+}
+
+/// Largest gap between consecutive deliveries in [from, to) µs after the start.
+fn max_gap(d: &[(i64, i64)], from: i64, to: i64) -> (i64, i64) {
+    d.windows(2)
+        .filter(|w| w[1].0 >= from && w[1].0 < to)
+        .map(|w| (w[1].0 - w[0].0, w[1].0))
+        .max()
+        .unwrap_or((0, 0))
+}
+
+/// Review A2: the receiver never plays a packet before libsrt's handshake
+/// rule (base = arrival of the handshake packet - its timestamp) would:
+/// by default (tsbpd_settle_ms 0) the due times are exactly that rule until
+/// the drift tracer's first update; with the opt-in settle they are never
+/// earlier (a fast handshake moves the base later, to the median data
+/// offset; a slow one is left as libsrt leaves it).
 #[test]
-fn tsbpd_base_settles_after_a_delayed_handshake() {
-    let run = |settle: u32| {
-        let mut l = cfg(120);
-        l.tsbpd_settle_ms = settle;
-        let mut s = Sim::new(cfg(120), l, 15, 300);
-        s.delay = Box::new(|side, d| if side == "a" && ctl_type(d) == Some(0) { Duration::from_millis(12) } else { Duration::ZERO });
-        s.connect();
-        // the application starts sending 3 s after connecting (the bench's T0 lead):
-        // the settle window opens with the first data packet, not at the handshake
-        s.run_until(Duration::from_secs(3), |_| false);
-        let (lat, missing) = run_frames(&mut s, 30, 20, Duration::from_millis(40), Duration::from_millis(400));
-        assert_eq!(missing, 0);
-        let max = *lat.iter().max().unwrap();
-        let min = *lat.iter().min().unwrap();
-        (min, max, s.conn().stats().us_tsbpd_settled)
-    };
-    let (min0, max0, _) = run(0);
-    let (min1, max1, moved) = run(1000);
-    eprintln!("no settle: {min0:?}..{max0:?}; settle: {min1:?}..{max1:?}, moved {moved} us");
-    assert!(min0 >= Duration::from_micros(146_900), "{min0:?}");
-    assert!(max1 <= Duration::from_micros(135_300) && min1 >= Duration::from_micros(134_900), "{min1:?}..{max1:?}");
-    assert!((11_500..=12_500).contains(&moved), "{moved}");
+fn tsbpd_never_plays_before_the_handshake_rule() {
+    for (settle, hs_ms, seed) in [(0, 0, 1u64), (0, 35, 2), (1000, 0, 3), (1000, 35, 4), (1000, 15, 5)] {
+        let (d, st) = tsbpd_timing_run(settle, Duration::from_millis(hs_ms), Duration::from_secs(4), seed);
+        assert!(d.len() >= 7990, "settle {settle} hs +{hs_ms} ms: {} delivered", d.len());
+        let lo = d.iter().map(|x| x.1).min().unwrap();
+        let hi = d.iter().map(|x| x.1).max().unwrap();
+        eprintln!("settle {settle} hs +{hs_ms} ms: due - libsrt rule {lo}..{hi} us, settled {} us", st.us_tsbpd_settled);
+        assert!(lo >= 0, "settle {settle} hs +{hs_ms} ms: plays {lo} us before libsrt's rule");
+        if settle == 0 || hs_ms > 15 {
+            assert_eq!((lo, hi, st.us_tsbpd_settled), (0, 0, 0), "settle {settle} hs +{hs_ms} ms");
+        }
+        if settle > 0 && hs_ms == 0 {
+            // the median of the data offsets: ~15 ms later than a handshake 15 ms faster
+            assert!((13_000..=17_000).contains(&(st.us_tsbpd_settled as i64)), "{}", st.us_tsbpd_settled);
+        }
+    }
+}
+
+/// Review A2: the old settle moved the base to the fastest packet and the
+/// drift tracer moved it back ~10 s later, a playout stall of up to
+/// latency / 8 (sim: 13.6 ms gap at t = 10 s). Now: by default nothing
+/// moves before the drift tracer, and with the opt-in settle the drift
+/// tracer starts from the settled base: no stall when it first applies,
+/// and afterwards both play at the same time.
+#[test]
+fn drift_tracer_first_update_has_no_delivery_gap() {
+    let dur = Duration::from_secs(14);
+    // a typical handshake (at the mean delay): libsrt's rule, no settle
+    let (d0, _) = tsbpd_timing_run(0, Duration::from_millis(15), dur, 11);
+    let g0 = max_gap(&d0, 2_000_000, 14_000_000);
+    // a fast handshake: the opt-in settle moves the base later at ~1 s
+    let (d1, st1) = tsbpd_timing_run(1000, Duration::ZERO, dur, 11);
+    let g1 = max_gap(&d1, 2_000_000, 14_000_000);
+    let s1 = max_gap(&d1, 0, 2_000_000);
+    // the same without the settle (libsrt): the drift tracer moves it at ~10 s
+    let (d2, _) = tsbpd_timing_run(0, Duration::ZERO, dur, 11);
+    let g2 = max_gap(&d2, 2_000_000, 14_000_000);
+    let tail = |d: &[(i64, i64)]| d.iter().rev().take(100).map(|x| x.1).sum::<i64>() / 100;
+    eprintln!(
+        "typical hs, no settle: gap {g0:?}; fast hs, settle: settle gap {s1:?} (moved {} us), drift gap {g1:?}; fast hs, no settle: drift gap {g2:?}; \
+         end offsets vs libsrt rule: {} / {} / {} us",
+        st1.us_tsbpd_settled,
+        tail(&d0),
+        tail(&d1),
+        tail(&d2)
+    );
+    let frame = 5_000;
+    assert!(g0.0 <= frame + 2_000, "{g0:?}");
+    assert!(g1.0 <= frame + 2_000, "{g1:?}");
+    // (libsrt's own behaviour: a fast handshake costs a stall when its drift tracer applies)
+    assert!(g2.0 > frame + 8_000, "{g2:?}");
+    // after the drift update the settled and the unsettled receiver play alike
+    assert!((tail(&d1) - tail(&d2)).abs() <= 2_000, "{} vs {}", tail(&d1), tail(&d2));
 }
 
 /// The same with FEC 10x5 staircase onreq: a group closes while its
@@ -1736,4 +1846,239 @@ fn auto_reorder_with_fec_cuts_spurious_naks_under_jitter() {
         assert_eq!((m0, m1), (0, 0), "loss {pct}");
         assert!(c1.pkt_retrans * 4 < c0.pkt_retrans, "auto {} off {}", c1.pkt_retrans, c0.pkt_retrans);
     }
+}
+
+/// Send `n` messages caller -> listener over a lossless wire and let every
+/// ACK come back (the caller's una then equals its next sequence).
+fn connected_and_acked(isn: u32, n: usize) -> Sim {
+    let mut s = Sim::new(cfg(120), cfg(120), 1, isn);
+    s.connect();
+    for i in 0..n {
+        s.caller.send_message(s.now, &[i as u8; 1316], None).unwrap();
+        s.run_until(Duration::from_micros(500), |_| false);
+    }
+    s.run_until(Duration::from_millis(100), |s| {
+        let now = s.now;
+        while s.conn().recv_message(now).is_some() {}
+        false
+    });
+    assert_eq!(s.caller.send_buffer_len(), 0);
+    s
+}
+
+/// Hand one crafted control packet to the caller (from the peer) and drain
+/// its output; returns (datagrams, DROPREQ ranges seen, time spent).
+fn feed_caller(s: &mut Sim, pkt: &[u8]) -> (usize, Vec<(u32, u32)>, Duration) {
+    let (now, b) = (s.now, s.b);
+    let t = Instant::now();
+    s.caller.handle_datagram(now, b, pkt);
+    let mut out = [0u8; 1500];
+    let mut n = 0;
+    let mut drops = Vec::new();
+    while let Some(tx) = s.caller.poll_transmit(now, &mut out) {
+        n += 1;
+        assert!(n < 10_000, "poll_transmit does not end");
+        if let Ok(Packet::Control { body: Control::DropReq { first, last }, .. }) = packet::decode(&out[..tx.len]) {
+            drops.push((first, last));
+        }
+    }
+    (n, drops, t.elapsed())
+}
+
+/// Review A2 PoC: a NAK range that straddles una (first after it, last
+/// before it, yet first < last in modular order: the order is not
+/// transitive) was inserted whole (~7.5e8 sequences) and popped one at a
+/// time by poll_transmit (5.5 s of CPU). Ranges are now checked by offsets
+/// from una: rejected, with bounded work.
+#[test]
+fn crafted_nak_ranges_are_rejected_with_bounded_work() {
+    let mut s = connected_and_acked(0x1000, 200);
+    let una = seq::seq_add(0x1000, 200);
+    let mut b = [0u8; 64];
+    let shapes = [
+        // the fuzz's shape: first 877M ahead of una, last 518M behind it
+        (seq::seq_add(una, 0x3445_51E4), seq::seq_add(una, -0x1EDD_CDD3)),
+        // first = una + 2^30 - 1, last = una - 2
+        (seq::seq_add(una, (1 << 30) - 1), seq::seq_add(una, -2)),
+        // both before una but longer than the send buffer
+        (seq::seq_add(una, -100_000), seq::seq_add(una, -1)),
+        // reversed
+        (seq::seq_add(una, -3), seq::seq_add(una, -5)),
+    ];
+    for (k, &(first, last)) in shapes.iter().enumerate() {
+        let inv = s.caller.stats().nak_invalid;
+        let loss = s.caller.stats().pkt_snd_loss;
+        let n = packet::encode_nak([(first, last)], 0, 0x1234, 10, &mut b);
+        let (sent, drops, dt) = feed_caller(&mut s, &b[..n]);
+        assert_eq!(s.caller.stats().nak_invalid, inv + 1, "shape {k}");
+        assert_eq!(s.caller.stats().pkt_snd_loss, loss, "shape {k}");
+        assert!(drops.is_empty() && sent <= 1, "shape {k}: {sent} {drops:?}");
+        let now = s.now;
+        assert_eq!(s.caller.snapshot(now).snd_loss_runs, 0, "shape {k}");
+        assert!(dt < Duration::from_millis(50), "shape {k}: {dt:?}");
+        assert!(s.caller.is_connected());
+    }
+    // a valid range behind una: one DROPREQ, nothing retransmitted
+    let n = packet::encode_nak([(seq::seq_add(una, -7), seq::seq_add(una, -3))], 0, 0x1234, 10, &mut b);
+    let (_, drops, _) = feed_caller(&mut s, &b[..n]);
+    assert_eq!(drops, vec![(seq::seq_add(una, -7), seq::seq_add(una, -3))]);
+    // a range from behind una into what is in flight: DROPREQ for the part
+    // behind it, retransmission of the rest
+    s.caller.send_message(s.now, &[9u8; 100], None).unwrap();
+    s.caller.send_message(s.now, &[9u8; 100], None).unwrap();
+    let mut out = [0u8; 1500];
+    let now = s.now;
+    while s.caller.poll_transmit(now, &mut out).is_some() {} // sent, not yet acknowledged
+    s.now += Duration::from_millis(50); // past the repair suppression
+    let retrans = s.caller.stats().pkt_retrans;
+    let n = packet::encode_nak([(seq::seq_add(una, -2), seq::seq_add(una, 1))], 0, 0x1234, 10, &mut b);
+    let (_, drops, _) = feed_caller(&mut s, &b[..n]);
+    assert_eq!(drops, vec![(seq::seq_add(una, -2), seq::seq_add(una, -1))]);
+    assert_eq!(s.caller.stats().pkt_retrans, retrans + 2);
+}
+
+/// DROPREQ ranges are checked by offsets from the delivery point too: one
+/// that straddles it (or reaches 2^29 away) is ignored and changes nothing.
+#[test]
+fn crafted_dropreq_ranges_are_rejected() {
+    let mut s = Sim::new(cfg(500), cfg(500), 5, 50);
+    s.connect();
+    s.drop = Box::new(|side, d| side == "a" && matches!(data_seq(d), Some(52..=53)));
+    for i in 0..6u8 {
+        s.caller.send_message(s.now, &[i; 10], None).unwrap();
+    }
+    s.run_until(Duration::from_millis(30), |_| false);
+    let now = s.now;
+    assert_eq!(s.conn().snapshot(now).rcv_loss_seqs, 2);
+    // the delivery point is 50 (TSBPD holds 50 and 51 for 500 ms)
+    let mut b = [0u8; 64];
+    let sid = s.conn().local_socket_id();
+    let a = s.a;
+    for (first, last) in [
+        (seq::seq_add(50, (1 << 29) + 10), seq::seq_add(50, (1 << 30) - 5)),
+        // first < last in modular order, but last is "before" the delivery point
+        (seq::seq_add(50, 3), seq::seq_add(50, 3 + (1 << 30) - 1)),
+        (54, 51),
+    ] {
+        let st = s.conn().stats().clone();
+        let n = packet::encode_dropreq(0, first, last, 0, sid, &mut b);
+        s.conn().handle_datagram(now, a, &b[..n]);
+        let st2 = s.conn().stats().clone();
+        assert_eq!(st2.dropreq_invalid, st.dropreq_invalid + 1, "{first:#x}..{last:#x}");
+        assert_eq!((st2.pkt_rcv_dropreq_seqs, st2.pkt_rcv_drop), (st.pkt_rcv_dropreq_seqs, st.pkt_rcv_drop));
+        assert_eq!(s.conn().snapshot(now).rcv_loss_seqs, 2);
+    }
+    // the holes are repaired, and a later loss is still detected (an
+    // accepted straddling range would have moved the highest received to
+    // the end of the window: no loss seen below it)
+    let mut first58 = true;
+    s.drop = Box::new(move |side, d| {
+        if side == "a" && data_seq(d) == Some(58) && first58 {
+            first58 = false;
+            return true;
+        }
+        false
+    });
+    for i in 6..12u8 {
+        s.caller.send_message(s.now, &[i; 10], None).unwrap();
+    }
+    let mut got = 0;
+    s.run_until(Duration::from_millis(1000), |s| {
+        let now = s.now;
+        while s.conn().recv_message(now).is_some() {
+            got += 1;
+        }
+        false
+    });
+    assert_eq!(got, 12);
+}
+
+/// A quick fuzz pass over crafted NAK, DROPREQ and ACK packets (seeded):
+/// random ranges around una / the delivery point and anywhere in the
+/// sequence space. Every packet must be handled with bounded work and the
+/// connection must keep delivering.
+#[test]
+fn fuzz_control_ranges_bounded_work() {
+    fuzz_control(0xF022_0001, 3000);
+}
+
+#[test]
+#[ignore]
+fn fuzz_control_ranges_bounded_work_long() {
+    for seed in 0..20u64 {
+        fuzz_control(0xF022_1000 + seed, 20_000);
+    }
+}
+
+fn fuzz_control(seed: u64, n: usize) {
+    let mut r = Rng(seed);
+    let isn = (r.next() % 0x7FFF_FFF0) as u32;
+    let mut s = Sim::new(cfg(120), cfg(120), 1, isn);
+    s.connect();
+    let mut b = [0u8; 64];
+    let mut out = [0u8; 1500];
+    let mut worst = Duration::ZERO;
+    let mut msgs = 0u32;
+    for k in 0..n {
+        if k % 4 == 0 {
+            let _ = s.caller.send_message(s.now, &[1u8; 200], None);
+            msgs += 1;
+        }
+        s.run_until(Duration::from_micros(200), |s| {
+            let now = s.now;
+            while s.conn().recv_message(now).is_some() {}
+            false
+        });
+        let una = seq::seq_add(isn, msgs as i32 - 5);
+        let pick = |r: &mut Rng| -> u32 {
+            match r.next() % 4 {
+                0 => seq::seq_add(una, (r.next() % 64) as i32 - 32),
+                1 => seq::seq_add(una, (r.next() % (1 << 31)) as i32),
+                2 => seq::seq_add(una, ((r.next() % (1 << 21)) as i32) - (1 << 20)),
+                _ => seq::seq_add(una, (1 << 30) + (r.next() % 64) as i32 - 32),
+            }
+        };
+        let (first, last) = (pick(&mut r), pick(&mut r));
+        let now = s.now;
+        let t = Instant::now();
+        match r.next() % 3 {
+            0 => {
+                let n = packet::encode_nak([(first, last)], 0, 0x1234, 10, &mut b);
+                let bb = s.b;
+                s.caller.handle_datagram(now, bb, &b[..n]);
+                let mut c = 0;
+                while s.caller.poll_transmit(now, &mut out).is_some() {
+                    c += 1;
+                    assert!(c < 10_000, "seed {seed:#x} step {k}: poll_transmit does not end");
+                }
+            }
+            1 => {
+                let sid = s.conn().local_socket_id();
+                let n = packet::encode_dropreq(0, first, last, 0, sid, &mut b);
+                let a = s.a;
+                s.conn().handle_datagram(now, a, &b[..n]);
+                let mut c = 0;
+                while s.conn().poll_transmit(now, &mut out).is_some() {
+                    c += 1;
+                    assert!(c < 10_000);
+                }
+                while s.conn().recv_message(now).is_some() {}
+            }
+            _ => {
+                let ack = srt_core::packet::Ack::light(first);
+                let n = packet::encode_ack(&ack, 0, 0, 0x1234, &mut b);
+                let bb = s.b;
+                s.caller.handle_datagram(now, bb, &b[..n]);
+                let mut c = 0;
+                while s.caller.poll_transmit(now, &mut out).is_some() {
+                    c += 1;
+                    assert!(c < 10_000);
+                }
+            }
+        }
+        worst = worst.max(t.elapsed());
+    }
+    eprintln!("fuzz seed {seed:#x}: {n} packets, worst {worst:?}, caller {:?}", s.caller.state());
+    assert!(worst < Duration::from_millis(200), "seed {seed:#x}: {worst:?}");
+    assert!(s.caller.is_connected());
 }

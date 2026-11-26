@@ -36,6 +36,9 @@ const HS_RSP_RESENDS: u32 = 5;
 const MAX_ACKACK_QUEUE: usize = 64;
 const MAX_DROPREQ_QUEUE: usize = 64;
 const DROP_LOG_MAX: usize = 32;
+/// A DROPREQ is ignored unless both ends lie within this many sequences of
+/// the delivery point.
+const DROPREQ_REACH: u32 = 1 << 29;
 /// Send a full ACK at least this often while holes keep its value
 /// unchanged (libsrt then sends none): the ACKACK keeps RTT samples coming.
 const ACK_RTT_PROBE_US: i64 = 50_000;
@@ -1076,16 +1079,6 @@ impl Connection {
                 }
             }
         }
-        // loss as libsrt counts it: gaps in the arrival sequence, before
-        // any FEC rebuild
-        let d = seq_off(self.phy_highest, hdr.seq);
-        if d > 1 {
-            st.pkt_rcv_loss += (d - 1) as u64;
-            st.byte_rcv_loss += (d - 1) as u64 * (payload.len() + PKT_OVERHEAD) as u64;
-        }
-        if d > 0 {
-            self.phy_highest = hdr.seq;
-        }
         if !self.rcv_started {
             self.rcv_started = true;
             self.next_ack_us = now_us + SYN_US;
@@ -1093,6 +1086,19 @@ impl Connection {
         }
         if seq_off(self.rcv.base, hdr.seq) >= self.rcv.capacity() as i32 && self.rcv.len() == 0 && self.tsbpd_rcv && self.cfg.tlpktdrop {
             self.rcv_resync(hdr.seq);
+        }
+        // loss as libsrt counts it: gaps in the arrival sequence, before
+        // any FEC rebuild (only within the receive window: a stray far
+        // sequence must not move it)
+        let in_window = (seq_off(self.rcv.base, hdr.seq) as u32) < self.rcv.capacity();
+        let d = if in_window { seq_off(self.phy_highest, hdr.seq) } else { 0 };
+        let st = &mut self.stats;
+        if d > 1 {
+            st.pkt_rcv_loss += (d - 1) as u64;
+            st.byte_rcv_loss += (d - 1) as u64 * (payload.len() + PKT_OVERHEAD) as u64;
+        }
+        if d > 0 {
+            self.phy_highest = hdr.seq;
         }
         match self.rcv.insert(hdr.seq, plain, hdr.timestamp, hdr.msgno, hdr.rexmit) {
             Insert::Stored { loss, filled_hole } => {
@@ -1348,8 +1354,10 @@ impl Connection {
     /// A new gap `a..=b`, revealed by a packet with timestamp `ts`: NAK it
     /// at once, or after the reorder tolerance (spec 6.3).
     fn on_loss(&mut self, now_us: i64, a: u32, b: u32, ts: u32) {
+        // kept without the TSBPD moves so far: it follows the base later
+        // (settle, drift) through `deadline_shift_us`
         let deadline_us = match (&self.tsbpd, self.tsbpd_rcv && self.cfg.tlpktdrop) {
-            (Some(t), true) => t.due_us(ts),
+            (Some(t), true) => t.due_us(ts) - t.moved_us(),
             _ => NEVER,
         };
         // with FEC the first NAK waits for the filter (or the cap); with
@@ -1423,8 +1431,13 @@ impl Connection {
 
     fn on_dropreq(&mut self, first: u32, last: u32) {
         self.stats.pkt_recv_dropreq += 1;
-        // malformed or absurdly far: ignore (as libsrt)
-        if seq_lt(last, first) || seq_off(self.rcv.base, first).unsigned_abs() > (1 << 29) {
+        // malformed or absurdly far: ignore (as libsrt). Offsets from one
+        // anchor (the delivery point), so the order is transitive: both ends
+        // within 2^29 of it, first <= last
+        let off_f = seq_off(self.rcv.base, first);
+        let off_l = seq_off(self.rcv.base, last);
+        if off_f > off_l || off_f.unsigned_abs() > DROPREQ_REACH || off_l.unsigned_abs() > DROPREQ_REACH {
+            self.stats.dropreq_invalid += 1;
             return;
         }
         self.stats.pkt_rcv_dropreq_seqs += self.rcv_loss.remove_range(first, last);
@@ -1452,24 +1465,31 @@ impl Connection {
 
     fn on_nak(&mut self, l: &LossList<'_>) {
         self.stats.pkt_recv_nak += 1;
-        for (mut first, last) in l.ranges() {
-            if seq_lt(last, first) || !seq_lt(last, self.snd.next_send) {
-                // beyond what we sent (libsrt would break the connection)
+        let una = self.snd.una;
+        let sent = seq_off(una, self.snd.next_send) as i64;
+        let cap = self.snd.capacity() as i64;
+        for (first, last) in l.ranges() {
+            // offsets from one anchor (una), so the order is transitive:
+            // modular `<` alone is not (a range can straddle una, "first
+            // after una" and "last before it", and still be first < last)
+            let off_f = seq_off(una, first) as i64;
+            let off_l = seq_off(una, last) as i64;
+            if off_f > off_l || off_l >= sent || off_l - off_f >= cap {
+                // reversed, beyond what we sent, or longer than the send
+                // buffer (libsrt rejects these and breaks the connection)
                 self.stats.nak_invalid += 1;
                 continue;
             }
-            self.stats.pkt_snd_loss += (seq_off(first, last) + 1) as u64;
-            let una = self.snd.una;
-            if seq_lt(first, una) {
+            self.stats.pkt_snd_loss += (off_l - off_f + 1) as u64;
+            if off_f < 0 {
                 // acknowledged or dropped: we no longer hold it
-                let dl = if seq_lt(last, una) { last } else { seq_dec(una) };
+                let dl = if off_l < 0 { last } else { seq_dec(una) };
                 self.queue_dropreq(first, dl);
-                if seq_lt(last, una) {
+                if off_l < 0 {
                     continue;
                 }
-                first = una;
             }
-            self.snd_loss.insert(first, last);
+            self.snd_loss.insert(if off_f < 0 { una } else { first }, last);
         }
     }
 
@@ -1536,13 +1556,15 @@ impl Connection {
         if self.snd.rexmits(una) > 0 || self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) || self.probe_dead == Some(una) {
             return None; // repaired before: the head probe watches it
         }
-        Some(self.snd.last_tx_us(una) + self.ack_head_threshold_us(una) + self.ack_wait_us())
+        let base = self.snd.last_tx_us(una) + self.ack_head_threshold_us(una);
+        Some(self.probe_deadline_cap(una, base + self.ack_wait_us(), base + SYN_US))
     }
 
     fn on_ack(&mut self, now_us: i64, ackno: u32, a: &Ack) {
         self.stats.pkt_recv_ack += 1;
-        if !seq_le(a.seq, self.snd.next_send) {
-            // beyond what we sent (libsrt would break the connection)
+        // offsets from una (transitive): beyond what we sent is invalid
+        // (libsrt would break the connection); before una is a stale ACK
+        if seq_off(self.snd.una, a.seq) > seq_off(self.snd.una, self.snd.next_send) {
             self.stats.ack_invalid += 1;
             return;
         }
@@ -1617,6 +1639,20 @@ impl Connection {
         }
         let cap = (self.snd_latency_ms as i64 * 1000 / 2).max(SYN_US);
         self.holdoff_cur_us.max(self.holdoff_prev_us).min(cap).max(SYN_US)
+    }
+
+    /// A probe of `seq` due at `at` (`min_at` with one ACK period instead
+    /// of the measured hold-off): the hold-off part of the wait never
+    /// pushes it past the last moment a copy can still be played (origin
+    /// + the peer's latency - a margin, as `rexmit_too_late`); without
+    /// TSBPD at the peer, `at`.
+    fn probe_deadline_cap(&self, seq: u32, at: i64, min_at: i64) -> i64 {
+        if self.snd_latency_ms == 0 || self.peer_flags & flags::TSBPDRCV == 0 {
+            return at;
+        }
+        let Some(o) = self.deadline_origin_us(seq) else { return at };
+        let last = o + self.snd_latency_ms as i64 * 1000 - PROBE_MARGIN_US;
+        at.min(last.max(min_at))
     }
 
     fn on_ackack(&mut self, now_us: i64, ackno: u32, ts: u32) {
@@ -1760,14 +1796,20 @@ impl Connection {
         if !self.cfg.tail_probe || !self.sender_arq() || !self.probe_armed || self.snd.unsent() > 0 || self.snd.in_flight() == 0 {
             return None;
         }
-        Some(self.last_data_tx_us + self.probe_delay_us())
+        let s = seq_dec(self.snd.next_send);
+        Some(self.probe_deadline_cap(s, self.last_data_tx_us + self.probe_delay_us(), self.last_data_tx_us + self.probe_min_delay_us()))
     }
 
     /// How long without an ACK past a packet before probing it: one RTT,
     /// its variation (at most RTT/2), one ACK period and a margin.
     fn probe_delay_us(&self) -> i64 {
+        self.probe_min_delay_us() - SYN_US + self.ack_wait_us()
+    }
+
+    /// The probe delay with one ACK period as the ACK wait.
+    fn probe_min_delay_us(&self) -> i64 {
         let r = self.srtt as i64;
-        r + (4 * self.rttvar as i64).min(r / 2) + self.ack_wait_us() + PROBE_MARGIN_US
+        r + (4 * self.rttvar as i64).min(r / 2) + SYN_US + PROBE_MARGIN_US
     }
 
     /// RTT from ACK/ACKACK samples or the handshake estimate.
@@ -1792,7 +1834,8 @@ impl Connection {
         if self.snd.rexmits(una) == 0 || self.snd_loss.peek() == Some(una) || self.rexmit_copy == Some(una) || self.probe_dead == Some(una) {
             return None;
         }
-        Some(self.snd.last_tx_us(una) + self.probe_delay_us())
+        let t = self.snd.last_tx_us(una);
+        Some(self.probe_deadline_cap(una, t + self.probe_delay_us(), t + self.probe_min_delay_us()))
     }
 
     /// Sender drop of too-late packets (spec 7.6, 12 #8), on a timer. The
@@ -1829,13 +1872,32 @@ impl Connection {
     }
 
     /// Do not retransmit a packet (re)sent less than this long ago: the
-    /// request was sent before the previous copy could have arrived.
+    /// request was sent before the previous copy could have arrived. With
+    /// `rexmit_suppress_libsrt`, libsrt's RETRANSMITALGO=1 window instead:
+    /// SRTT - 4 RTTVar after the last retransmission (0 or less: none).
     fn rexmit_suppress_us(&self) -> i64 {
         if !self.rtt_known() {
             return 0;
         }
         let (r, v) = (self.srtt as i64, self.rttvar as i64);
+        if self.cfg.rexmit_suppress_libsrt {
+            return r - 4 * v;
+        }
         (r - v).max(r / 2)
+    }
+
+    /// A request for `seq` falls within the suppression window of its last
+    /// copy. With `rexmit_first_always` (or `rexmit_suppress_libsrt`) only
+    /// a retransmitted copy counts, as libsrt: the first request for a
+    /// packet is always served (a receiver that NAKs a loss once, as
+    /// libsrt's FEC `onreq` does, may send it sooner than an RTT after the
+    /// original under jitter; suppressing it loses the packet).
+    #[inline]
+    fn suppressed(&self, seq: u32, now_us: i64, window_us: i64) -> bool {
+        if (self.cfg.rexmit_first_always || self.cfg.rexmit_suppress_libsrt) && self.snd.rexmits(seq) == 0 {
+            return false;
+        }
+        now_us - self.snd.last_tx_us(seq) < window_us
     }
 
     /// The earliest time `handle_timeout` should run, or a message becomes
@@ -2012,10 +2074,16 @@ impl Connection {
             let suppress = self.rexmit_suppress_us();
             while let Some(seq) = self.snd_loss.peek() {
                 if !self.snd.holds_sent(seq) {
-                    self.snd_loss.pop();
+                    // acknowledged or dropped since it was queued: forget
+                    // the whole part behind una at once (never per sequence)
+                    if seq_lt(seq, self.snd.una) {
+                        self.snd_loss.remove_before(self.snd.una);
+                    } else {
+                        self.snd_loss.drop_front_run();
+                    }
                     continue;
                 }
-                if now_us - self.snd.last_tx_us(seq) < suppress {
+                if self.suppressed(seq, now_us, suppress) {
                     self.snd_loss.pop();
                     self.stats.pkt_rexmit_suppressed += 1;
                     continue;
@@ -2084,14 +2152,30 @@ impl Connection {
         None
     }
 
+    /// The origin time the receiver's give-up of a missing `seq` follows:
+    /// a TSBPD receiver (libsrt's and ours) drops a hole only when the next
+    /// packet it has is due, so not before `seq + 1`'s play time. With
+    /// `rexmit_deadline_next`, the later of `seq`'s and `seq + 1`'s origin
+    /// (None when nothing after `seq` is held: no receiver can give it up
+    /// yet; the sender drop still bounds it); else `seq`'s own.
+    fn deadline_origin_us(&self, seq: u32) -> Option<i64> {
+        let o = self.snd.origin_us(seq);
+        if !self.cfg.rexmit_deadline_next {
+            return Some(o);
+        }
+        let n = seq_inc(seq);
+        self.snd.holds(n).then(|| o.max(self.snd.origin_us(n)))
+    }
+
     /// A retransmission of `seq` sent now would reach a TSBPD receiver
-    /// after its play time (it plays a packet at origin + latency + the
-    /// one-way delay; the copy arrives at now + the one-way delay): skip it.
+    /// after it gave the packet up (it plays a packet at origin + latency +
+    /// the one-way delay, and drops a hole when the next packet is due; the
+    /// copy arrives at now + the one-way delay): skip it.
     fn rexmit_too_late(&self, seq: u32, now_us: i64) -> bool {
         if self.snd_latency_ms == 0 || self.peer_flags & flags::TSBPDRCV == 0 {
             return false;
         }
-        now_us > self.snd.origin_us(seq) + self.snd_latency_ms as i64 * 1000
+        self.deadline_origin_us(seq).map_or(false, |o| now_us > o + self.snd_latency_ms as i64 * 1000)
     }
 
     /// Too little time left before the receiver plays `seq` for another
@@ -2100,7 +2184,8 @@ impl Connection {
         if !self.rtt_known() || self.snd_latency_ms == 0 {
             return false;
         }
-        let left = self.snd.origin_us(seq) + self.snd_latency_ms as i64 * 1000 - now_us;
+        let Some(o) = self.deadline_origin_us(seq) else { return false };
+        let left = o + self.snd_latency_ms as i64 * 1000 - now_us;
         let r = self.srtt as i64;
         let round = 3 * r / 2 + (4 * self.rttvar as i64).min(r / 2) + LAST_CHANCE_MARGIN_US;
         left < round
@@ -2137,6 +2222,12 @@ impl Connection {
         (self.srtt as i64 / 8).max(SPREAD_MARGIN_US)
     }
 
+    /// Add to a stored hole deadline to get its deadline now.
+    #[inline]
+    fn deadline_shift_us(&self) -> i64 {
+        self.tsbpd.as_ref().map_or(0, |t| t.moved_us())
+    }
+
     fn encode_due_nak(&mut self, now_us: i64, ts: u32, buf: &mut [u8]) -> Option<(usize, bool)> {
         let interval = self.renak_interval_us();
         let min_repair = if self.rtt_known() { self.srtt as i64 } else { 0 };
@@ -2155,7 +2246,7 @@ impl Connection {
         };
         let (seqs, late) = self
             .rcv_loss
-            .collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, &mut out);
+            .collect_due(now_us, NAK_SLACK_US, interval, min_repair, reserve, max_words, self.deadline_shift_us(), &mut out);
         self.renak_sched_us = interval;
         let r = if out.is_empty() {
             None
@@ -2293,6 +2384,7 @@ impl Connection {
                 return None;
             }
             let n = self.rcv.drop_until(f.seq);
+            let shift = tsbpd.moved_us();
             if self.drop_log.len() < DROP_LOG_MAX {
                 for h in self.rcv_loss.front_runs_before(self.rcv.base) {
                     if self.drop_log.len() < DROP_LOG_MAX {
@@ -2302,7 +2394,7 @@ impl Connection {
                             naks: h.naks,
                             detected_us: h.detected_us,
                             last_nak_us: h.last_nak_us,
-                            deadline_us: h.deadline_us,
+                            deadline_us: if h.deadline_us == NEVER { NEVER } else { h.deadline_us + shift },
                             dropped_us: now_us,
                         });
                     }
@@ -2327,5 +2419,155 @@ impl Connection {
 
     pub(crate) fn caller_key(&self) -> (SocketAddr, u32, u32) {
         (self.peer, self.peer_sid, self.isn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::listener::{Listener, ListenerAction};
+
+    /// A connected caller (sender) and its accepted peer over a zero-delay
+    /// wire.
+    fn pair(lat: u16) -> (Connection, Connection, Instant) {
+        let t0 = Instant::now();
+        let a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let cfg = Config::default().with_latency_ms(lat);
+        let mut c = Connection::connect(cfg.clone(), t0, b, 7, 100);
+        let mut l = Listener::new(cfg, t0);
+        let mut buf = [0u8; 1500];
+        let mut out = [0u8; 1500];
+        let mut acc = None;
+        for _ in 0..10 {
+            while let Some(t) = c.poll_transmit(t0, &mut buf) {
+                match l.handle(t0, a, &buf[..t.len], &mut out) {
+                    ListenerAction::Reply(n) => c.handle_datagram(t0, b, &out[..n]),
+                    ListenerAction::Accept(x) => acc = Some(*x),
+                    _ => {}
+                }
+            }
+            if let Some(p) = acc.as_mut() {
+                while let Some(t) = p.poll_transmit(t0, &mut buf) {
+                    c.handle_datagram(t0, b, &buf[..t.len]);
+                }
+            }
+            if c.is_connected() {
+                break;
+            }
+        }
+        assert!(c.is_connected());
+        (c, acc.unwrap(), t0)
+    }
+
+    /// Review A2 item 5: the measured ACK hold-off part of a probe's wait
+    /// never pushes it past the last moment its copy can still be played
+    /// (the receiver's give-up of the hole - 1 ms); it never goes below one
+    /// ACK period either.
+    #[test]
+    fn probe_wait_is_capped_by_the_packet_deadline() {
+        for next in [true, false] {
+            let (mut c, _p, t0) = pair(60);
+            c.cfg.rexmit_deadline_next = next;
+            c.srtt = 24_000;
+            c.rttvar = 6_000;
+            c.rtt_valid = true;
+            c.holdoff_cur_us = 40_000; // capped at L / 2 = 30 ms
+            let now = t0 + Duration::from_millis(100);
+            let now_us = c.us(now);
+            let mut buf = [0u8; 1500];
+            c.send_message(now, &[1; 100], None).unwrap();
+            while c.poll_transmit(now, &mut buf).is_some() {}
+            // RTT 24 + RTTVar term 12 + hold-off 30 + 1 = 67 ms: past origin + 60
+            assert_eq!(c.probe_delay_us(), 67_000);
+            // the newest packet: with `next`, no receiver can give it up before
+            // a later packet exists (no cap); else its own origin + L - 1 ms
+            let tail = if next { now_us + 67_000 } else { now_us + 59_000 };
+            assert_eq!(c.probe_at_us(), Some(tail), "tail probe, next {next}");
+            // a second packet 2 ms later: the head's give-up follows it with `next`
+            let later = now + Duration::from_millis(2);
+            c.send_message(later, &[2; 100], None).unwrap();
+            while c.poll_transmit(later, &mut buf).is_some() {}
+            let una = c.snd.una;
+            c.snd.count_rexmit(una);
+            let head = if next { now_us + 2_000 + 59_000 } else { now_us + 59_000 };
+            assert_eq!(c.head_probe_at_us(), Some(head), "head probe, next {next}");
+            // a short hold-off is not cut
+            c.holdoff_cur_us = 5_000;
+            assert_eq!(c.head_probe_at_us(), Some(now_us + 47_000));
+            // the cap never goes below one ACK period of wait
+            c.holdoff_cur_us = 40_000;
+            c.srtt = 50_000;
+            c.rttvar = 1_000;
+            assert_eq!(c.head_probe_at_us(), Some(now_us + 50_000 + 4_000 + 10_000 + 1_000));
+            // without TSBPD at the peer there is no deadline
+            c.peer_flags &= !flags::TSBPDRCV;
+            assert_eq!(c.head_probe_at_us(), Some(now_us + 50_000 + 4_000 + 30_000 + 1_000));
+        }
+    }
+
+    /// Review A2 item 3: a libsrt FEC (`onreq`) receiver NAKs a loss once,
+    /// when its group closes; under jitter that NAK can come sooner than
+    /// the suppression window after the original. The first request for a
+    /// packet never retransmitted is always served (`rexmit_first_always`,
+    /// libsrt's rule); a repeat within the window of the last copy is not.
+    #[test]
+    fn first_request_is_served_even_soon_after_the_original() {
+        for first_always in [true, false] {
+            let (mut c, _p, t0) = pair(120);
+            c.cfg.rexmit_first_always = first_always;
+            c.srtt = 30_000;
+            c.rttvar = 3_000;
+            c.rtt_valid = true;
+            let now = t0 + Duration::from_millis(100);
+            let mut buf = [0u8; 1500];
+            for i in 0..3u8 {
+                c.send_message(now, &[i; 100], None).unwrap();
+            }
+            while c.poll_transmit(now, &mut buf).is_some() {}
+            let seq = c.snd.una;
+            let nak = |c: &mut Connection, at: Instant, buf: &mut [u8; 1500]| {
+                let mut b = [0u8; 64];
+                let n = packet::encode_nak([(seq, seq)], 0, c.local_sid, 10, &mut b);
+                let peer = c.peer;
+                c.handle_datagram(at, peer, &b[..n]);
+                let mut sent = 0;
+                while c.poll_transmit(at, buf).is_some() {
+                    sent += 1;
+                }
+                sent
+            };
+            // 10 ms after the original (window max(SRTT - RTTVar, SRTT / 2) = 27 ms)
+            let t1 = now + Duration::from_millis(10);
+            let sent = nak(&mut c, t1, &mut buf);
+            assert_eq!((sent, c.stats.pkt_retrans), if first_always { (1, 1) } else { (0, 0) }, "first_always {first_always}");
+            // a repeat 5 ms after that copy is suppressed either way
+            let t2 = t1 + Duration::from_millis(5);
+            let before = c.stats.pkt_retrans;
+            nak(&mut c, t2, &mut buf);
+            if first_always {
+                assert_eq!(c.stats.pkt_retrans, before);
+            }
+        }
+    }
+
+    /// Review A2 item 6: a hole's deadline follows TSBPD base moves made
+    /// after it was found (drift tracer, settle).
+    #[test]
+    fn hole_deadline_follows_the_tsbpd_base() {
+        let (_c, mut p, t0) = pair(120);
+        let now_us = p.us(t0 + Duration::from_millis(50));
+        p.on_loss(now_us, 500, 502, 40_000);
+        let before = p.rcv_loss.front_runs_before(503).next().unwrap().deadline_us + p.deadline_shift_us();
+        assert_eq!(before, p.tsbpd.as_ref().unwrap().due_us(40_000));
+        // the drift tracer moves the base 7 ms later (5 ms base, 2 ms drift)
+        let t = p.tsbpd.as_mut().unwrap();
+        for i in 0..1000u32 {
+            let ts = 50_000 + i * 10;
+            t.drift_sample(ts, t.base_time_us(ts) + 7_000, None);
+        }
+        let after = p.rcv_loss.front_runs_before(503).next().unwrap().deadline_us + p.deadline_shift_us();
+        assert_eq!(after, before + 7_000);
+        assert_eq!(after, p.tsbpd.as_ref().unwrap().due_us(40_000));
     }
 }

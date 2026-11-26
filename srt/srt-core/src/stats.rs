@@ -29,8 +29,12 @@ pub struct Stats {
     pub pkt_sent_ackack: u64,
     /// ACKs ignored because they acknowledged beyond what was sent.
     pub ack_invalid: u64,
-    /// NAKs with sequences beyond what was sent.
+    /// NAK ranges ignored: reversed, beyond what was sent, or longer than
+    /// the send buffer.
     pub nak_invalid: u64,
+    /// DROPREQs ignored: reversed, or an end more than 2^29 from the
+    /// delivery point.
+    pub dropreq_invalid: u64,
     /// Messages refused because the send buffer was full.
     pub send_would_block: u64,
     /// NAKed sequences not retransmitted because they had been (re)sent
@@ -74,8 +78,8 @@ pub struct Stats {
     pub byte_rcv_drop: u64,
     /// Packets arriving after their slot was delivered or dropped (pktRcvBelated).
     pub pkt_rcv_belated: u64,
-    /// How far (µs, total) data packets moved the TSBPD base earlier in
-    /// the settle window (`Config::tsbpd_settle_ms`).
+    /// How far (µs) the opt-in TSBPD settle moved the base later
+    /// (`Config::tsbpd_settle_ms`; 0 when off).
     pub us_tsbpd_settled: u64,
     /// Originals (not retransmissions) that filled a hole: reordered on the path.
     pub pkt_rcv_reordered: u64,

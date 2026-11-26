@@ -136,7 +136,8 @@ impl SrtSocketSet {
             self.timers.pop();
         }
         if self.timers.len() > 64 + 4 * self.socks.len() {
-            self.timers = self.socks.iter().enumerate().filter_map(|(i, e)| e.due.map(|t| Reverse((t, i)))).collect();
+            let socks = &self.socks;
+            self.timers.retain(|Reverse((t, i))| socks[*i].due == Some(*t));
         }
     }
 
