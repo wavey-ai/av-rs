@@ -319,8 +319,8 @@ impl Crypto {
     fn iv(&self, seq: u32) -> [u8; 16] {
         let mut iv = [0u8; 16];
         iv[10..14].copy_from_slice(&seq.to_be_bytes());
-        for i in 0..14 {
-            iv[i] ^= self.salt[i];
+        for (b, s) in iv.iter_mut().zip(&self.salt[..14]) {
+            *b ^= s;
         }
         iv
     }

@@ -451,7 +451,7 @@ impl Connection {
         c.tsbpd = Some(Tsbpd::new(0, hs_timestamp, n.rcv_latency_ms, c.cfg.drift_tracer));
         #[cfg(feature = "aes")]
         {
-            c.crypto = n.crypto.clone();
+            c.crypto.clone_from(&n.crypto);
         }
         let send_filter = n.filter.is_some() && n.peer_flags & flags::FILTERCAP != 0;
         c.filter = n.filter;

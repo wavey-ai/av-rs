@@ -180,7 +180,7 @@ fn encrypted_transfer_with_fec() {
     let mut c = cfg(Some("0123456789abc"));
     c.packet_filter = Some("fec,cols:10,rows:5,layout:staircase,arq:onreq".into());
     let mut l = cfg(Some("0123456789abc"));
-    l.packet_filter = c.packet_filter.clone();
+    l.packet_filter.clone_from(&c.packet_filter);
     let (w, got) = transfer(c, l, 2);
     assert_eq!(got, 3000);
     let st = w.conn.as_ref().unwrap().stats().clone();
