@@ -7,7 +7,7 @@ use crate::UdpOptions;
 use mio::event::Source;
 use mio::{Interest, Registry, Token};
 use srt_core::packet::dst_socket_id;
-use srt_core::{AcceptCallback, Config, Connection, Delivered, Listener, ListenerAction, SendError};
+use srt_core::{AcceptCallback, AcceptSecretCallback, Config, Connection, Delivered, Listener, ListenerAction, SendError};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
@@ -62,6 +62,12 @@ impl SrtListener {
 
     pub fn set_accept_callback(&mut self, cb: Option<AcceptCallback>) {
         self.acceptor.set_accept_callback(cb);
+    }
+
+    /// Access control that also picks each connection's passphrase (see
+    /// `srt_core::AcceptSecretCallback`).
+    pub fn set_accept_secret_callback(&mut self, cb: Option<AcceptSecretCallback>) {
+        self.acceptor.set_accept_secret_callback(cb);
     }
 
     /// Accepted-but-not-yet-`accept()`ed connections allowed before BACKLOG rejections.
