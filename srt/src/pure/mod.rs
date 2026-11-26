@@ -4,9 +4,10 @@
 //! Differences from the libsrt backend (see the crate's README section):
 //! - no `sys` module and no `raw_stats` (libsrt's `SRT_TRACEBSTATS`):
 //!   `stats()` returns `srt_core::Stats` instead;
-//! - a passphrase (caller option or listener callback) is refused with a
-//!   clear error unless AES is available: the connection never runs
-//!   unencrypted;
+//! - encryption is srt-core's AES-CTR (16-byte keys unless the listener
+//!   advertises another length); a caller and listener whose passphrases
+//!   differ, or where only one side has one, are rejected (as libsrt with
+//!   SRTO_ENFORCEDENCRYPTION, its default): never unencrypted;
 //! - `set_log_handler` receives this backend's own warnings (refused
 //!   connections, I/O errors), not libsrt's log lines.
 
@@ -41,8 +42,8 @@ const BYTES_PER_PKT: i32 = 1472;
 /// libsrt's SRTO_CONNTIMEO default.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Whether this build can encrypt (AES). Without it a passphrase is refused.
-pub const ENCRYPTION_SUPPORTED: bool = false;
+/// Whether this build can encrypt (AES-CTR, srt-core's `aes` feature).
+pub const ENCRYPTION_SUPPORTED: bool = true;
 
 // ------------------------------------------------------------------ logging
 
@@ -130,13 +131,7 @@ pub(crate) fn connect_config(o: &ConnectOptions) -> Result<Config> {
         if p.len() < 10 || p.len() > 79 {
             return Err(invalid("srt_setsockopt"));
         }
-        if !ENCRYPTION_SUPPORTED {
-            return Err(Error::IOError(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "srt_connect: a passphrase (AES encryption) was requested, which this wavey-srt pure-rust build does not support; \
-                 refusing to connect unencrypted",
-            )));
-        }
+        cfg.passphrase = Some(p.clone());
     }
     if let Some(s) = &o.stream_id {
         if s.len() > 512 {
@@ -278,6 +273,11 @@ impl Stream {
     /// larger of its own and the peer's proposal.
     pub fn latency_ms(&self) -> (u16, u16) {
         self.h.sh.latency_ms()
+    }
+
+    /// AES key length of the connection's encryption, bytes (None: clear).
+    pub fn encryption_key_len(&self) -> Option<usize> {
+        self.h.sh.key_len()
     }
 }
 

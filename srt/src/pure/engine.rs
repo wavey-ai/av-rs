@@ -124,6 +124,8 @@ pub(crate) struct ConnState {
     pub max_message: usize,
     /// Negotiated (receive, send) TSBPD latency, ms.
     pub latency_ms: (u16, u16),
+    /// AES key length in use, bytes (None: clear).
+    pub key_len: Option<usize>,
     pub stream_id: Option<String>,
     pub peer: SocketAddr,
     pub stats: Option<Stats>,
@@ -161,6 +163,7 @@ impl ConnShared {
                 tx_waker: None,
                 max_message,
                 latency_ms: (0, 0),
+                key_len: None,
                 stream_id: stream_id.filter(|s| !s.is_empty()),
                 peer,
                 stats: None,
@@ -283,6 +286,10 @@ impl ConnShared {
     pub fn latency_ms(&self) -> (u16, u16) {
         lock(&self.st).latency_ms
     }
+
+    pub fn key_len(&self) -> Option<usize> {
+        lock(&self.st).key_len
+    }
 }
 
 /// Whether a lingering connection is done: all written data acknowledged.
@@ -321,6 +328,7 @@ fn service(conn: &mut Connection, sh: &ConnShared, now: Instant, lingering: bool
             st.status = Status::Open;
             st.max_message = conn.max_message();
             st.latency_ms = conn.latencies_ms();
+            st.key_len = conn.encryption_key_len();
             wake_rx = true;
             wake_tx = true;
         }
@@ -670,13 +678,16 @@ impl Drop for ListenerHandle {
     }
 }
 
-/// What the listener's handshake acceptor asks the application's callback.
-fn decide(ls: &ListenerShared, rq: &AcceptRequest<'_>) -> std::result::Result<(), RejectReason> {
+/// What the listener's handshake acceptor asks the application's callback:
+/// reject, or accept with the connection's passphrase (`Some`: the caller
+/// must encrypt with it; srt-core rejects a caller whose encryption does
+/// not match, so nothing ever runs unencrypted against the callback's wish).
+fn decide(ls: &ListenerShared, rq: &AcceptRequest<'_>) -> std::result::Result<Option<String>, RejectReason> {
     if ls.stopped.load(Ordering::Acquire) {
         return Err(RejectReason::Close);
     }
     let guard = lock(&ls.callback);
-    let Some(cb) = guard.as_ref() else { return Ok(()) };
+    let Some(cb) = guard.as_ref() else { return Ok(None) };
     let action = match catch_unwind(AssertUnwindSafe(|| cb.callback(rq.stream_id))) {
         Ok(a) => a,
         Err(_) => {
@@ -688,15 +699,7 @@ fn decide(ls: &ListenerShared, rq: &AcceptRequest<'_>) -> std::result::Result<()
     drop(guard);
     match action {
         ListenerCallbackAction::Deny => Err(RejectReason::Unknown),
-        ListenerCallbackAction::Allow { passphrase: None } => Ok(()),
-        ListenerCallbackAction::Allow { passphrase: Some(_) } => {
-            ls.push_error(format!(
-                "srt connection from {} (stream id {:?}) refused: the listener callback requires a passphrase (AES encryption), \
-                 which this wavey-srt pure-rust build does not support; it is never run unencrypted",
-                rq.peer, rq.stream_id
-            ));
-            Err(RejectReason::Unsecure)
-        }
+        ListenerCallbackAction::Allow { passphrase } => Ok(passphrase),
     }
 }
 
@@ -724,7 +727,7 @@ pub(crate) fn start_listener(addr: SocketAddr, cfg: Config, opts: UdpOptions) ->
         local,
     });
     let cb_ls = ls.clone();
-    l.set_accept_callback(Some(Box::new(move |rq: &AcceptRequest<'_>| decide(&cb_ls, rq))));
+    l.set_accept_secret_callback(Some(Box::new(move |rq: &AcceptRequest<'_>| decide(&cb_ls, rq))));
     let tls = ls.clone();
     let mut io = io;
     thread::Builder::new().name("srt-rs-listener".into()).spawn(move || {
@@ -734,7 +737,7 @@ pub(crate) fn start_listener(addr: SocketAddr, cfg: Config, opts: UdpOptions) ->
             Err(_) => "panicked".to_string(),
         };
         // the callback closure (in `l`) holds the shared state: break the cycle
-        l.set_accept_callback(None);
+        l.set_accept_secret_callback(None);
         let mut st = lock(&tls.st);
         st.dead = Some(why);
         let w = st.waker.take();
@@ -803,7 +806,11 @@ fn run_listener(io: &mut Io, l: &mut SrtListener, ls: &Arc<ListenerShared>) {
                         c.stream_id().map(str::to_string),
                         c.max_message(),
                     );
-                    lock(&sh.st).latency_ms = c.latencies_ms();
+                    {
+                        let mut st = lock(&sh.st);
+                        st.latency_ms = c.latencies_ms();
+                        st.key_len = c.encryption_key_len();
+                    }
                     conns.insert(id, sh.clone());
                     new.push((sh, c.peer_addr()));
                     room -= 1;

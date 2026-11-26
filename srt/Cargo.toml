@@ -15,7 +15,7 @@ default = ["libsrt"]
 libsrt = ["dep:srt-sys"]
 # The pure Rust backend (srt-core + srt-mio). Use with default-features = false
 # so srt-sys is not built; when both backends are enabled, pure-rust is used.
-pure-rust = ["dep:srt-core", "dep:srt-mio", "dep:mio"]
+pure-rust = ["dep:srt-core", "dep:srt-mio", "dep:mio", "srt-core/aes"]
 async = ["tokio", "srt-sys?/async"]
 
 [dependencies]

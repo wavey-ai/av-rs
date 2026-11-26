@@ -67,16 +67,19 @@ fn options_map_to_config() {
 }
 
 #[test]
-fn passphrase_without_aes_is_refused() {
-    if ENCRYPTION_SUPPORTED {
-        return;
-    }
-    let e = connect_config(&ConnectOptions {
+fn passphrase_maps_to_config() {
+    let cfg = connect_config(&ConnectOptions {
         passphrase: Some("thepassphrase".into()),
         ..Default::default()
     })
-    .unwrap_err();
-    assert!(e.to_string().contains("refusing to connect unencrypted"), "{}", e);
+    .unwrap();
+    assert_eq!(cfg.passphrase.as_deref(), Some("thepassphrase"));
+    // libsrt accepts 10..=79 characters
+    assert!(connect_config(&ConnectOptions {
+        passphrase: Some("short".into()),
+        ..Default::default()
+    })
+    .is_err());
 }
 
 #[test]
@@ -285,10 +288,8 @@ mod async_tests {
     }
 
     #[tokio::test]
-    async fn test_async_passphrase_refused_without_aes() {
-        if ENCRYPTION_SUPPORTED {
-            return;
-        }
+    async fn test_async_passphrase() {
+        // the libsrt backend's test, unchanged
         let port = free_port();
         let listener = AsyncListener::bind_with_options(("127.0.0.1", port), [ListenerOption::TooLatePacketDrop(false)].iter().cloned())
             .unwrap()
@@ -299,22 +300,49 @@ mod async_tests {
                 }
             })
             .unwrap();
-        // a caller without a passphrase is rejected, never connected in clear
-        let options = ConnectOptions {
+
+        let mut options = ConnectOptions {
+            passphrase: Some("notthepassphrase".to_string()),
             stream_id: Some("mystreamid".to_string()),
             ..Default::default()
         };
-        let (a, c) = join!(listener.accept(), AsyncStream::connect(("127.0.0.1", port), &options));
-        assert!(c.is_err());
-        let e = a.err().expect("accept reports the refusal");
-        assert!(e.to_string().contains("passphrase"), "{}", e);
-        // a caller with one is refused before sending anything
+
+        assert!(AsyncStream::connect(("127.0.0.1", port), &options).await.is_err());
+
+        options.passphrase = Some("thepassphrase".to_string());
+        let (accept_result, connect_result) = join!(listener.accept(), AsyncStream::connect(("127.0.0.1", port), &options));
+        let mut server_conn = accept_result.unwrap().0;
+        let mut client_conn = connect_result.unwrap();
+        assert_eq!(client_conn.id(), options.stream_id.as_ref());
+
+        assert_eq!(client_conn.write(b"foo").await.unwrap(), 3);
+
+        let mut buf = [0; 1316];
+        assert_eq!(server_conn.read(&mut buf).await.unwrap(), 3);
+        assert_eq!(&buf[0..3], b"foo");
+    }
+
+    #[tokio::test]
+    async fn test_async_passphrase_mismatch_is_never_clear() {
+        let port = free_port();
+        let listener = AsyncListener::bind(("127.0.0.1", port))
+            .unwrap()
+            .with_callback(|_: Option<&_>| ListenerCallbackAction::Allow {
+                passphrase: Some("thepassphrase".to_string()),
+            })
+            .unwrap();
+        // a caller without a passphrase is rejected, never connected in clear
+        let e = AsyncStream::connect(("127.0.0.1", port), &ConnectOptions::default()).await.err().expect("rejected");
+        assert_eq!(e.to_string(), "srt_connect error: 1002 (errno = 0)");
+        // and a caller with one, against a listener without
+        let port2 = free_port();
+        let _plain = AsyncListener::bind(("127.0.0.1", port2)).unwrap();
         let options = ConnectOptions {
             passphrase: Some("thepassphrase".to_string()),
-            stream_id: Some("mystreamid".to_string()),
             ..Default::default()
         };
-        assert!(AsyncStream::connect(("127.0.0.1", port), &options).await.is_err());
+        assert!(AsyncStream::connect(("127.0.0.1", port2), &options).await.is_err());
+        drop(listener);
     }
 
     #[tokio::test]

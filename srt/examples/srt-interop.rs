@@ -1,8 +1,8 @@
 //! Interop driver for wavey-srt (either backend), used by tests/interop.rs.
 //!
 //! ```text
-//! srt-interop listen ADDR [--secs N] [--deny SID] [--write-back N] [--out FILE]
-//! srt-interop call ADDR [--sid SID] [--count N] [--size B] [--interval-us U] [--read-back N]
+//! srt-interop listen ADDR [--secs N] [--deny SID] [--passphrase P] [--write-back N --expect M] [--out FILE]
+//! srt-interop call ADDR [--sid SID] [--passphrase P] [--count N] [--size B] [--interval-us U] [--read-back N]
 //! ```
 //!
 //! `listen` accepts one connection through `AsyncListener` + callback,
@@ -61,6 +61,16 @@ fn latency(_s: &AsyncStream) -> String {
     "null".into()
 }
 
+#[cfg(feature = "pure-rust")]
+fn key_len(s: &AsyncStream) -> String {
+    s.encryption_key_len().map_or("null".into(), |k| k.to_string())
+}
+
+#[cfg(not(feature = "pure-rust"))]
+fn key_len(_s: &AsyncStream) -> String {
+    "null".into()
+}
+
 /// MPEG-TS check over the received byte stream: 188-byte packets with
 /// sync bytes, and the continuity counter of every PID (a lost or
 /// reordered message shows as a CC error).
@@ -113,6 +123,7 @@ async fn listen(args: &[String]) {
     let addr = args.get(2).expect("ADDR").clone();
     let secs: u64 = arg(args, "--secs").and_then(|s| s.parse().ok()).unwrap_or(30);
     let deny = arg(args, "--deny");
+    let pass = arg(args, "--passphrase");
     let write_back: u32 = arg(args, "--write-back").and_then(|s| s.parse().ok()).unwrap_or(0);
     // write back once this many messages arrived
     let expect: u64 = arg(args, "--expect").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -133,7 +144,7 @@ async fn listen(args: &[String]) {
             seen2.lock().unwrap().push(sid.map(str::to_string));
             match (&deny, sid) {
                 (Some(d), Some(s)) if d == s => ListenerCallbackAction::Deny,
-                _ => ListenerCallbackAction::Allow { passphrase: None },
+                _ => ListenerCallbackAction::Allow { passphrase: pass.clone() },
             }
         })
         .expect("callback");
@@ -205,7 +216,7 @@ async fn listen(args: &[String]) {
     };
     let sizes: Vec<String> = sizes.iter().map(|(k, v)| format!("\"{}\":{}", k, v)).collect();
     println!(
-        "{{\"backend\":\"{}\",\"accepted\":true,\"peer\":\"{}\",\"stream_id\":{},\"callback_sids\":[{}],\"latency_ms\":{},\
+        "{{\"backend\":\"{}\",\"accepted\":true,\"peer\":\"{}\",\"stream_id\":{},\"callback_sids\":[{}],\"latency_ms\":{},\"key_len\":{},\
 \"messages\":{},\"bytes\":{},\"fnv\":\"{:016x}\",\"seq_in_order\":{},\"seq_gaps\":{},\"ts_packets\":{},\"ts_resyncs\":{},\"ts_cc_errors\":{},\
 \"sizes\":{{{}}},\"first_ms\":{},\"last_ms\":{},\"end\":{},\"wrote_back\":{}}}",
         srt::BACKEND,
@@ -213,6 +224,7 @@ async fn listen(args: &[String]) {
         opt_str(&s.id().cloned()),
         callback_sids.join(","),
         latency(&s),
+        key_len(&s),
         msgs,
         bytes,
         hash,
@@ -237,6 +249,7 @@ async fn call(args: &[String]) {
     let read_back: u32 = arg(args, "--read-back").and_then(|s| s.parse().ok()).unwrap_or(0);
     let opts = ConnectOptions {
         stream_id: arg(args, "--sid"),
+        passphrase: arg(args, "--passphrase"),
         max_send_payload_size: Some(1316),
         ..Default::default()
     };
@@ -295,12 +308,13 @@ async fn call(args: &[String]) {
     // sent and acknowledged (libsrt drops unsent data on close)
     tokio::time::sleep(Duration::from_millis(500)).await;
     println!(
-        "{{\"backend\":\"{}\",\"connected\":true,\"connect_ms\":{:.1},\"sent\":{},\"fnv\":\"{:016x}\",\"latency_ms\":{},\"read_back\":{},\"read_back_in_order\":{}}}",
+        "{{\"backend\":\"{}\",\"connected\":true,\"connect_ms\":{:.1},\"sent\":{},\"fnv\":\"{:016x}\",\"latency_ms\":{},\"key_len\":{},\"read_back\":{},\"read_back_in_order\":{}}}",
         srt::BACKEND,
         connect_ms,
         sent,
         hash,
         latency(&s),
+        key_len(&s),
         got,
         in_order
     );

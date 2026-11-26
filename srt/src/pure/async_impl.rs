@@ -132,6 +132,11 @@ impl AsyncStream {
     pub fn latency_ms(&self) -> (u16, u16) {
         self.h.sh.latency_ms()
     }
+
+    /// AES key length of the connection's encryption, bytes (None: clear).
+    pub fn encryption_key_len(&self) -> Option<usize> {
+        self.h.sh.key_len()
+    }
 }
 
 impl AsyncRead for AsyncStream {
