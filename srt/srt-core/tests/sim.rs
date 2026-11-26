@@ -1565,9 +1565,18 @@ fn weak_set_c_small_buffers() {
 }
 
 fn jitter_run(auto: bool, pct: f64, seed: u64) -> (usize, srt_core::Stats, srt_core::Stats) {
+    jitter_run_f(auto, pct, seed, None)
+}
+
+fn jitter_run_f(auto: bool, pct: f64, seed: u64, filter: Option<&str>) -> (usize, srt_core::Stats, srt_core::Stats) {
     let mut lcfg = cfg(120);
+    let mut ccfg = cfg(120);
+    if let Some(f) = filter {
+        lcfg = fcfg(120, f);
+        ccfg = fcfg(120, f);
+    }
     lcfg.auto_reorder = auto;
-    let mut s = Sim::new(cfg(120), lcfg, 15, 21);
+    let mut s = Sim::new(ccfg, lcfg, 15, 21);
     s.connect();
     let mut rng = Rng(seed);
     let mut rng2 = Rng(seed ^ 0xABCD);
@@ -1591,5 +1600,137 @@ fn auto_reorder_cuts_spurious_naks_under_jitter() {
         assert_eq!((m0, m1), (0, 0), "loss {pct}");
         assert!(r1.pkt_rcv_reordered > 100);
         assert!(c1.pkt_retrans * 20 < c0.pkt_retrans, "auto {} off {}", c1.pkt_retrans, c0.pkt_retrans);
+    }
+}
+
+/// Row FEC without ARQ at random loss: every data packet that was the only
+/// loss of its row (20 data + 1 FEC) must be rebuilt, every other loss must
+/// stay missing. Checks the receiver against the row arithmetic, packet by
+/// packet (the bench saw ~10 % more unrecovered losses than libsrt).
+fn row_fec_check(per: usize, frames: usize, pct: f64, fixed: bool, seed: u64) {
+    let f = "fec,cols:20,rows:1,arq:never";
+    let isn = 1000u32;
+    let mut s = Sim::new(fcfg(120, f), fcfg(120, f), 15, isn);
+    s.connect();
+    let dropped: std::rc::Rc<std::cell::RefCell<(Vec<u32>, Vec<u32>)>> = Default::default();
+    let dd = dropped.clone();
+    let mut rng = Rng(seed);
+    s.drop = Box::new(move |side, d| {
+        if side != "a" {
+            return false;
+        }
+        let Some(q) = data_seq(d) else { return false };
+        if rng.chance(pct) {
+            if is_fec(d) {
+                dd.borrow_mut().1.push(q);
+            } else {
+                dd.borrow_mut().0.push(q);
+            }
+            return true;
+        }
+        false
+    });
+    let mut sent_at: Vec<Instant> = Vec::new();
+    let mut got = std::collections::HashSet::new();
+    let interval = Duration::from_micros(41_667);
+    let mut next = s.now;
+    let mut nf = 0;
+    s.run_until(interval * frames as u32 + Duration::from_millis(600), |s| {
+        if nf < frames && s.now >= next {
+            for _ in 0..per {
+                let i = sent_at.len() as u32;
+                let m = if fixed { let mut m = vec![0x47u8; 1316]; m[..4].copy_from_slice(&i.to_be_bytes()); m } else { vmsg(i) };
+                s.caller.send_message(s.now, &m, None).unwrap();
+                sent_at.push(s.now);
+            }
+            nf += 1;
+            next += interval;
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            got.insert(u32::from_be_bytes(m.payload[..4].try_into().unwrap()));
+        }
+        false
+    });
+    let (data_lost, fec_lost) = dropped.borrow().clone();
+    let total = sent_at.len() as u32;
+    let row = |q: u32| (q - isn) / 20;
+    let mut lost_in_row = std::collections::HashMap::<u32, u32>::new();
+    for &q in &data_lost {
+        *lost_in_row.entry(row(q)).or_default() += 1;
+    }
+    for &q in &fec_lost {
+        *lost_in_row.entry(row(q)).or_default() += 1; // a FEC packet carries its row's last seq
+    }
+    let last_row = (total - 1) / 20;
+    let mut should_rebuild = 0;
+    let mut missed = Vec::new();
+    let mut extra = 0;
+    for &q in &data_lost {
+        let i = q - isn;
+        let r = row(q);
+        let recoverable = lost_in_row[&r] == 1 && r < last_row;
+        if recoverable {
+            should_rebuild += 1;
+            if !got.contains(&i) {
+                missed.push(q);
+            }
+        } else if got.contains(&i) {
+            extra += 1;
+        }
+    }
+    let st = s.conn().stats().clone();
+    eprintln!("data lost {} fec lost {} should rebuild {} missed {} extra {} supply {}", data_lost.len(), fec_lost.len(), should_rebuild, missed.len(), extra, st.pkt_rcv_filter_supply);
+    assert!(missed.is_empty(), "rebuildable losses not rebuilt: {:?} (of {should_rebuild})", &missed[..missed.len().min(20)]);
+    assert_eq!(extra, 0);
+}
+
+#[test]
+fn fec_row_arq_never_rebuilds_every_single_loss_row() {
+    row_fec_check(330, 120, 2.0, false, 0xFEC0_0001);
+    // the bench's shape: 1316-byte payloads, 657 per frame (166 Mbit/s)
+    row_fec_check(657, 120, 1.0, true, 0xFEC0_0002);
+}
+
+/// The handshake that sets the receiver's TSBPD base came 12 ms late
+/// (jitter): with `tsbpd_settle_ms` the first data packets move the base
+/// back, so packets play at origin + owd + latency; without it (libsrt's
+/// rule) every packet plays 12 ms late for the whole connection.
+#[test]
+fn tsbpd_base_settles_after_a_delayed_handshake() {
+    let run = |settle: u32| {
+        let mut l = cfg(120);
+        l.tsbpd_settle_ms = settle;
+        let mut s = Sim::new(cfg(120), l, 15, 300);
+        s.delay = Box::new(|side, d| if side == "a" && ctl_type(d) == Some(0) { Duration::from_millis(12) } else { Duration::ZERO });
+        s.connect();
+        let (lat, missing) = run_frames(&mut s, 30, 20, Duration::from_millis(40), Duration::from_millis(400));
+        assert_eq!(missing, 0);
+        let max = *lat.iter().max().unwrap();
+        let min = *lat.iter().min().unwrap();
+        (min, max, s.conn().stats().us_tsbpd_settled)
+    };
+    let (min0, max0, _) = run(0);
+    let (min1, max1, moved) = run(1000);
+    eprintln!("no settle: {min0:?}..{max0:?}; settle: {min1:?}..{max1:?}, moved {moved} us");
+    assert!(min0 >= Duration::from_micros(146_900), "{min0:?}");
+    assert!(max1 <= Duration::from_micros(135_300) && min1 >= Duration::from_micros(134_900), "{min1:?}..{max1:?}");
+    assert!((11_500..=12_500).contains(&moved), "{moved}");
+}
+
+/// The same with FEC 10x5 staircase onreq: a group closes while its
+/// "missing" packet is only late, and the filter releases it for a NAK at
+/// once; with auto_reorder the released hole waits the observed reorder
+/// lateness first.
+#[test]
+fn auto_reorder_with_fec_cuts_spurious_naks_under_jitter() {
+    let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+    for pct in [0.0, 1.0] {
+        let (m0, c0, r0) = jitter_run_f(false, pct, 78, Some(f));
+        let (m1, c1, r1) = jitter_run_f(true, pct, 78, Some(f));
+        eprintln!("fec loss {pct}%: off: naks {} retrans {} | auto: naks {} retrans {} reordered {} supply {}",
+            r0.nak_seqs_sent, c0.pkt_retrans, r1.nak_seqs_sent, c1.pkt_retrans, r1.pkt_rcv_reordered, r1.pkt_rcv_filter_supply);
+        assert_eq!((m0, m1), (0, 0), "loss {pct}");
+        assert!(c1.pkt_retrans * 4 < c0.pkt_retrans, "auto {} off {}", c1.pkt_retrans, c0.pkt_retrans);
     }
 }

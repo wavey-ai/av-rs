@@ -280,6 +280,23 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   Sim, 0-10 ms uniform jitter on data, RTT 30, L 120, 9600 packets:
   9056 needless retransmissions without, 66 with; with 1 % loss also no
   frame lost.
+- With FEC (`onreq`/`always`) a group closes while its "missing" packet is
+  only late; a hole the filter releases then waits the same reorder wait
+  after its detection (never past its cap) before its first NAK. Bench:
+  srt-rs-fec, 25 Mbit/s, jitter 5 ms, 0 % loss sent 15337 retransmissions;
+  sim (FEC 10x5 staircase, 0-10 ms jitter): 7115 -> 69.
+
+## TSBPD base settle (rs2)
+
+- The base comes from the handshake packet (`now - ts`, libsrt's rule). If
+  that packet was delayed (jitter, queueing), every packet plays that much
+  late for the whole connection; libsrt's drift tracer moves only after
+  1000 ACKACK samples and by at most 5 ms per step. For `tsbpd_settle_ms`
+  (default 1000) after the base is set, an original data packet arriving
+  earlier than the base predicts moves the base back to it (never later):
+  the base becomes the least-delayed one-way offset seen.
+  Bench: srt-rs-fec, 25 Mbit/s, jitter 5 ms: every frame 11.5 ms late
+  (0+360L) from one late handshake. Sim, handshake +12 ms: 147 -> 135.05 ms.
 
 ## srt-mio
 

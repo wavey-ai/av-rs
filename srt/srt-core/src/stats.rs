@@ -74,6 +74,9 @@ pub struct Stats {
     pub byte_rcv_drop: u64,
     /// Packets arriving after their slot was delivered or dropped (pktRcvBelated).
     pub pkt_rcv_belated: u64,
+    /// How far (µs, total) data packets moved the TSBPD base earlier in
+    /// the settle window (`Config::tsbpd_settle_ms`).
+    pub us_tsbpd_settled: u64,
     /// Originals (not retransmissions) that filled a hole: reordered on the path.
     pub pkt_rcv_reordered: u64,
     pub pkt_rcv_duplicate: u64,

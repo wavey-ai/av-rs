@@ -455,6 +455,9 @@ impl Connection {
         c.peer_stream_id.clone_from(&caller.stream_id);
         c.tsbpd_rcv = c.cfg.tsbpd && n.peer_flags & flags::TSBPDSND != 0;
         c.tsbpd = Some(Tsbpd::new(0, hs_timestamp, n.rcv_latency_ms, c.cfg.drift_tracer));
+        if let Some(t) = c.tsbpd.as_mut() {
+            t.settle_for(0, c.cfg.tsbpd_settle_ms as i64 * 1000);
+        }
         let send_filter = n.filter.is_some() && n.peer_flags & flags::FILTERCAP != 0;
         c.filter = n.filter;
         c.setup_filter(); // the listener checked the config
@@ -878,6 +881,9 @@ impl Connection {
         self.rcv_latency_ms = if rsp.flags & flags::TSBPDSND != 0 { rsp.send_delay_ms } else { 0 };
         self.tsbpd_rcv = self.cfg.tsbpd && rsp.flags & flags::TSBPDSND != 0;
         self.tsbpd = Some(Tsbpd::new(now_us, ts, self.rcv_latency_ms, self.cfg.drift_tracer));
+        if let Some(t) = self.tsbpd.as_mut() {
+            t.settle_for(now_us, self.cfg.tsbpd_settle_ms as i64 * 1000);
+        }
         self.hs_pending = false;
         self.set_connected(now_us);
     }
@@ -906,6 +912,13 @@ impl Connection {
         }
         if hdr.rexmit {
             st.pkt_rcv_retrans += 1;
+        } else if self.tsbpd_rcv {
+            if let Some(t) = self.tsbpd.as_mut() {
+                let moved = t.observe_arrival(hdr.timestamp, now_us);
+                if moved > 0 {
+                    st.us_tsbpd_settled += moved as u64;
+                }
+            }
         }
         // loss as libsrt counts it: gaps in the arrival sequence, before
         // any FEC rebuild
@@ -1068,11 +1081,12 @@ impl Connection {
     }
 
     fn fec_release_range(&mut self, now_us: i64, first: u32, last: u32) {
+        let w = self.reorder_wait_us();
         match self.arq {
             // counted as libsrt does (fec.cpp reports losses only for onreq)
-            Some(ArqLevel::OnReq) => self.stats.pkt_rcv_filter_loss += self.rcv_loss.release_range(first, last, now_us),
+            Some(ArqLevel::OnReq) => self.stats.pkt_rcv_filter_loss += self.rcv_loss.release_range(first, last, now_us, w),
             Some(ArqLevel::Always) => {
-                self.rcv_loss.release_range(first, last, now_us);
+                self.rcv_loss.release_range(first, last, now_us, w);
             }
             _ => {}
         }
