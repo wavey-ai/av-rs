@@ -4,7 +4,8 @@
 //! `srt-io MODE ADDR [key=value ...]`
 //! - MODE: `call-send`, `call-recv`, `listen-send`, `listen-recv`
 //! - keys: `latency` (ms, default 120), `filter` (SRTO_PACKETFILTER string),
-//!   `streamid`, `secs` (run time, default 10), `in` (TS file to send),
+//!   `streamid`, `secs` (send: how long to send, then linger 2 x latency + 1 s
+//!   and close; recv: the longest wait, default 10), `in` (TS file to send),
 //!   `out` (file the payloads go to), `rate` (Mbit/s the file is paced at,
 //!   default 10), `payload` (default 1316)
 //!
@@ -134,7 +135,10 @@ fn main() -> std::io::Result<()> {
     }
     poll.registry().register(&mut timer, Token(1), Interest::READABLE)?;
     let mut ev = Events::with_capacity(64);
-    let stop = t0 + Duration::from_secs_f64(secs);
+    let linger = Duration::from_millis(latency as u64 * 2 + 1000);
+    // senders: `secs` of sending (from the start), then the linger
+    let stop = t0 + Duration::from_secs_f64(secs) + if sending { linger + Duration::from_secs(20) } else { Duration::ZERO };
+    let send_until = t0 + Duration::from_secs_f64(secs);
     let mut connected_at: Option<Instant> = None;
     let mut sent = 0u64;
     let mut off = 0usize;
@@ -162,6 +166,9 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+        if sending && connected && send_done_at.is_none() && now >= send_until {
+            send_done_at = Some(now);
+        }
         if sending && connected && send_done_at.is_none() {
             let start = connected_at.unwrap();
             while off < input.len() && start + pace * sent as u32 <= now {
@@ -179,7 +186,7 @@ fn main() -> std::io::Result<()> {
         }
         if let Some(t) = send_done_at {
             // linger for the receiver's latency and repairs, then close
-            if now >= t + Duration::from_millis(latency as u64 * 2 + 1000) {
+            if now >= t + linger {
                 end.close(now);
                 break;
             }
@@ -212,17 +219,18 @@ fn main() -> std::io::Result<()> {
         }
     }
     let now = Instant::now();
+    let js = |o: Option<&str>| o.map_or("null".to_string(), |v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")));
     let summary = match end.conn() {
         Some(c) => {
             let st = c.stats();
             let sn = c.snapshot(now);
+            let (lr, ls) = c.latencies_ms();
             format!(
-                "{{\"mode\":\"{mode}\",\"connected\":{},\"connect_ms\":{},\"sent_msgs\":{sent},\"recv_msgs\":{msgs},\"recv_bytes\":{bytes},\"ts_sync_errors\":{sync_err},\"stream_id\":{:?},\"filter\":{:?},\"latency_rcv_snd\":{:?},\"peer_version\":\"{:#x}\",\"rcv_loss\":{},\"rcv_drop\":{},\"rcv_fec_supply\":{},\"snd_retrans\":{},\"snd_drop\":{},\"rtt_ms\":{:.2},\"closed\":{:?}}}",
+                "{{\"mode\":\"{mode}\",\"connected\":{},\"connect_ms\":{:.1},\"sent_msgs\":{sent},\"recv_msgs\":{msgs},\"recv_bytes\":{bytes},\"ts_sync_errors\":{sync_err},\"stream_id\":{},\"filter\":{},\"latency_rcv_snd\":[{lr},{ls}],\"peer_version\":\"{:#x}\",\"rcv_loss\":{},\"rcv_drop\":{},\"rcv_fec_supply\":{},\"snd_retrans\":{},\"snd_drop\":{},\"rtt_ms\":{:.2},\"closed\":{}}}",
                 connected_at.is_some(),
                 connected_at.map_or(-1.0, |t| (t - t0).as_secs_f64() * 1e3),
-                c.stream_id(),
-                sn.packet_filter,
-                c.latencies_ms(),
+                js(c.stream_id()),
+                js(sn.packet_filter.as_deref()),
                 sn.peer_srt_version,
                 st.pkt_rcv_loss,
                 st.pkt_rcv_drop,
@@ -230,7 +238,7 @@ fn main() -> std::io::Result<()> {
                 st.pkt_retrans,
                 st.pkt_snd_drop,
                 sn.rtt_us as f64 / 1000.0,
-                closed_reason
+                js(closed_reason.as_deref())
             )
         }
         None => format!("{{\"mode\":\"{mode}\",\"connected\":false}}"),
