@@ -126,7 +126,7 @@ pub enum MaxBandwidth {
     Absolute(u64),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ConnectOptions {
     pub passphrase: Option<String>,
     pub stream_id: Option<String>,
@@ -136,6 +136,22 @@ pub struct ConnectOptions {
     pub send_buffer_size: Option<i32>,
     pub max_bandwidth: Option<MaxBandwidth>,
     pub max_send_payload_size: Option<i32>,
+}
+
+/// The passphrase is never printed.
+impl fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "<redacted>"))
+            .field("stream_id", &self.stream_id)
+            .field("timestamp_based_packet_delivery_mode", &self.timestamp_based_packet_delivery_mode)
+            .field("too_late_packet_drop", &self.too_late_packet_drop)
+            .field("receive_buffer_size", &self.receive_buffer_size)
+            .field("send_buffer_size", &self.send_buffer_size)
+            .field("max_bandwidth", &self.max_bandwidth)
+            .field("max_send_payload_size", &self.max_send_payload_size)
+            .finish()
+    }
 }
 
 #[repr(i32)]
@@ -175,6 +191,18 @@ mod api_test {
         assert_eq!(e.to_string(), "srt_recv error: 2001 (errno = 0)");
         let io = io::Error::new(io::ErrorKind::Other, e);
         assert!(io.to_string().contains("srt_recv error: 2001"));
+    }
+
+    #[test]
+    fn connect_options_debug_redacts_the_passphrase() {
+        let o = ConnectOptions {
+            passphrase: Some("very-secret-passphrase".into()),
+            stream_id: Some("sid".into()),
+            ..Default::default()
+        };
+        let d = format!("{:?}", o);
+        assert!(!d.contains("very-secret"), "{}", d);
+        assert!(d.contains("<redacted>") && d.contains("sid"), "{}", d);
     }
 
     #[test]

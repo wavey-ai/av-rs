@@ -77,6 +77,9 @@ pub(crate) enum Cmd {
     Close(u32),
     /// The listener handle was dropped: stop accepting.
     StopListening,
+    /// Tests: make the I/O thread panic.
+    #[cfg(test)]
+    Panic,
 }
 
 /// How handles reach the I/O thread.
@@ -420,6 +423,26 @@ fn mark_closed(sh: &ConnShared, r: CloseReason) {
         st.status = Status::Closed(close_code(&r, st.status == Status::Open));
         st.close_reason = Some(r);
     }
+    wake_all(sh, st);
+}
+
+/// The I/O thread serving this connection ended (it failed or panicked)
+/// before closing it: readers, writers and a pending connect get
+/// SRT_ESOCKFAIL from now on (after what was already received), never a
+/// hang. Nothing if the connection was closed already.
+fn mark_failed(sh: &ConnShared) {
+    let mut st = lock(&sh.st);
+    if !matches!(st.status, Status::Closed(_)) {
+        st.status = Status::Closed(SRT_ESOCKFAIL);
+    }
+    wake_all(sh, st);
+}
+
+fn panic_text(e: &(dyn std::any::Any + Send)) -> &str {
+    e.downcast_ref::<String>().map(String::as_str).or_else(|| e.downcast_ref::<&str>().copied()).unwrap_or("?")
+}
+
+fn wake_all(sh: &ConnShared, mut st: MutexGuard<'_, ConnState>) {
     let (rw, tw) = (st.rx_waker.take(), st.tx_waker.take());
     drop(st);
     sh.cv.notify_all();
@@ -520,19 +543,28 @@ pub(crate) fn start_caller(remote: SocketAddr, cfg: Config, opts: UdpOptions) ->
     io.poll.registry().register(&mut sock, SOCK, Interest::READABLE)?;
     let sh = ConnShared::new(ctl, sock.connection().local_socket_id(), Status::Connecting, remote, stream_id, max_message);
     let tsh = sh.clone();
-    thread::Builder::new()
-        .name("srt-rs-caller".into())
-        .spawn(move || run_caller(io, sock, tsh))?;
+    thread::Builder::new().name("srt-rs-caller".into()).spawn(move || {
+        if let Err(e) = catch_unwind(AssertUnwindSafe(|| run_caller(io, sock, &tsh))) {
+            crate::pure::log_warn(&format!("srt caller I/O thread panicked: {}", panic_text(&*e)));
+        }
+        // however the loop ended, the handle never waits on a dead thread
+        mark_failed(&tsh);
+    })?;
     Ok(ConnHandle { sh })
 }
 
-fn run_caller(mut io: Io, mut sock: SrtSocket, sh: Arc<ConnShared>) {
+fn run_caller(mut io: Io, mut sock: SrtSocket, sh: &ConnShared) {
     let mut linger: Option<Instant> = None;
     loop {
         let now = Instant::now();
         for c in io.take_cmds() {
-            if let Cmd::Close(_) = c {
-                linger.get_or_insert(now + LINGER);
+            match c {
+                Cmd::Close(_) => {
+                    linger.get_or_insert(now + LINGER);
+                }
+                Cmd::StopListening => {}
+                #[cfg(test)]
+                Cmd::Panic => panic!("test: caller I/O thread killed"),
             }
         }
         if let Err(e) = sock.drive_io(now) {
@@ -540,23 +572,23 @@ fn run_caller(mut io: Io, mut sock: SrtSocket, sh: Arc<ConnShared>) {
                 crate::pure::log_warn(&format!("srt caller I/O error: {e}"));
             }
         }
-        service(sock.connection_mut(), &sh, now, linger.is_some());
+        service(sock.connection_mut(), sh, now, linger.is_some());
         if let Err(e) = sock.flush(now) {
             if !soft_io_error(&e) {
                 crate::pure::log_warn(&format!("srt caller send error: {e}"));
             }
         }
         if let Some(d) = linger {
-            if now >= d || drained(sock.connection(), &sh) {
+            if now >= d || drained(sock.connection(), sh) {
                 let _ = sock.close(now);
-                mark_closed(&sh, CloseReason::Local);
+                mark_closed(sh, CloseReason::Local);
                 return;
             }
         }
         if sock.connection().is_closed() && sock.pending_datagrams() == 0 {
             // the status (and what was buffered) is with the handle; a
             // later Close command has nothing left to do
-            service(sock.connection_mut(), &sh, now, linger.is_some());
+            service(sock.connection_mut(), sh, now, linger.is_some());
             return;
         }
         let mut wake = linger.unwrap_or(now + MAX_SLEEP).min(now + MAX_SLEEP);
@@ -688,7 +720,9 @@ fn decide(ls: &ListenerShared, rq: &AcceptRequest<'_>) -> std::result::Result<Op
     }
     let guard = lock(&ls.callback);
     let Some(cb) = guard.as_ref() else { return Ok(None) };
-    let action = match catch_unwind(AssertUnwindSafe(|| cb.callback(rq.stream_id))) {
+    // libsrt hands the hook its stream id buffer: "" when the caller sent none
+    let sid = Some(rq.stream_id.unwrap_or(""));
+    let action = match catch_unwind(AssertUnwindSafe(|| cb.callback(sid))) {
         Ok(a) => a,
         Err(_) => {
             drop(guard);
@@ -699,7 +733,18 @@ fn decide(ls: &ListenerShared, rq: &AcceptRequest<'_>) -> std::result::Result<Op
     drop(guard);
     match action {
         ListenerCallbackAction::Deny => Err(RejectReason::Unknown),
-        ListenerCallbackAction::Allow { passphrase } => Ok(passphrase),
+        ListenerCallbackAction::Allow { passphrase } => match crate::pure::check_passphrase(passphrase) {
+            Ok(p) => Ok(p),
+            Err(_) => {
+                // libsrt: setting SRTO_PASSPHRASE fails, the hook returns
+                // -1 and the caller is rejected (accept() sees nothing)
+                crate::pure::log_warn(&format!(
+                    "srt listener callback gave a passphrase outside 10..=80 bytes for {} (stream id {:?}): rejected",
+                    rq.peer, rq.stream_id
+                ));
+                Err(RejectReason::Unknown)
+            }
+        },
     }
 }
 
@@ -731,17 +776,32 @@ pub(crate) fn start_listener(addr: SocketAddr, cfg: Config, opts: UdpOptions) ->
     let tls = ls.clone();
     let mut io = io;
     thread::Builder::new().name("srt-rs-listener".into()).spawn(move || {
-        let r = catch_unwind(AssertUnwindSafe(|| run_listener(&mut io, &mut l, &tls)));
+        // connections handed to the application (or queued for accept()):
+        // kept here so they can be failed whatever ends the loop
+        let mut conns: HashMap<u32, Arc<ConnShared>> = HashMap::new();
+        let r = catch_unwind(AssertUnwindSafe(|| run_listener(&mut io, &mut l, &tls, &mut conns)));
         let why = match r {
             Ok(()) => "stopped".to_string(),
-            Err(_) => "panicked".to_string(),
+            Err(e) => {
+                let why = format!("panicked: {}", panic_text(&*e));
+                crate::pure::log_warn(&format!("srt listener I/O thread {why}"));
+                why
+            }
         };
         // the callback closure (in `l`) holds the shared state: break the cycle
         l.set_accept_secret_callback(None);
         let mut st = lock(&tls.st);
+        let queued: Vec<_> = st.q.drain(..).collect();
         st.dead = Some(why);
         let w = st.waker.take();
         drop(st);
+        // no connection of this listener can make progress any more
+        for (sh, _) in &queued {
+            mark_failed(sh);
+        }
+        for sh in conns.values() {
+            mark_failed(sh);
+        }
         tls.cv.notify_all();
         if let Some(w) = w {
             w.wake();
@@ -750,9 +810,7 @@ pub(crate) fn start_listener(addr: SocketAddr, cfg: Config, opts: UdpOptions) ->
     Ok(ListenerHandle { ls })
 }
 
-fn run_listener(io: &mut Io, l: &mut SrtListener, ls: &Arc<ListenerShared>) {
-    // connections handed to the application (or queued for accept())
-    let mut conns: HashMap<u32, Arc<ConnShared>> = HashMap::new();
+fn run_listener(io: &mut Io, l: &mut SrtListener, ls: &Arc<ListenerShared>, conns: &mut HashMap<u32, Arc<ConnShared>>) {
     // dropped handles whose connection still sends: id -> deadline
     let mut lingering: HashMap<u32, Instant> = HashMap::new();
     let mut stopped = false;
@@ -768,6 +826,8 @@ fn run_listener(io: &mut Io, l: &mut SrtListener, ls: &Arc<ListenerShared>) {
                     }
                 }
                 Cmd::StopListening => stopped = true,
+                #[cfg(test)]
+                Cmd::Panic => panic!("test: listener I/O thread killed"),
             }
         }
         if stopped {
@@ -828,7 +888,7 @@ fn run_listener(io: &mut Io, l: &mut SrtListener, ls: &Arc<ListenerShared>) {
             }
         }
         let mut gone = Vec::new();
-        for (id, sh) in &conns {
+        for (id, sh) in conns.iter() {
             if let Some(c) = l.connection_mut(*id) {
                 if service(c, sh, now, lingering.contains_key(id)) {
                     gone.push(*id);

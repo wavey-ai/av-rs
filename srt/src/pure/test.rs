@@ -1,5 +1,6 @@
 //! Tests of the pure Rust backend's API surface (blocking and tokio).
 
+use super::engine::{self, lock};
 use crate::*;
 use std::convert::TryInto;
 use std::io::{Read, Write};
@@ -74,12 +75,157 @@ fn passphrase_maps_to_config() {
     })
     .unwrap();
     assert_eq!(cfg.passphrase.as_deref(), Some("thepassphrase"));
-    // libsrt accepts 10..=79 characters
-    assert!(connect_config(&ConnectOptions {
-        passphrase: Some("short".into()),
+    // libsrt accepts 10..=80 bytes (HAICRYPT_SECRET_MAX_SZ), or "" for none
+    let with = |p: String| {
+        connect_config(&ConnectOptions {
+            passphrase: Some(p),
+            ..Default::default()
+        })
+    };
+    for bad in ["short".to_string(), "p".repeat(9), "p".repeat(81)] {
+        match with(bad) {
+            Err(Error::SRTError { fn_name, code, errno }) => assert_eq!((fn_name, code, errno), ("srt_setsockopt", 5003, 0)),
+            other => panic!("{:?}", other),
+        }
+    }
+    assert_eq!(with("p".repeat(10)).unwrap().passphrase.map(|p| p.len()), Some(10));
+    assert_eq!(with("p".repeat(80)).unwrap().passphrase.map(|p| p.len()), Some(80));
+    assert_eq!(with(String::new()).unwrap().passphrase, None);
+    assert_eq!(check_passphrase(Some("p".repeat(81))).ok(), None);
+    assert_eq!(check_passphrase(Some(String::new())).unwrap(), None);
+}
+
+/// A listener with one accepted stream and its caller.
+fn pair(port: u16, sid: Option<&str>) -> (Listener<'static>, Stream, Stream) {
+    let listener = Listener::bind(("127.0.0.1", port)).unwrap();
+    let opts = ConnectOptions {
+        stream_id: sid.map(str::to_string),
         ..Default::default()
-    })
-    .is_err());
+    };
+    let c = std::thread::spawn(move || Stream::connect(("127.0.0.1", port), &opts).unwrap());
+    let (s, _) = listener.accept().unwrap();
+    (listener, s, c.join().unwrap())
+}
+
+/// `f` must finish within `secs` (a hang fails the test instead of blocking it).
+fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(secs)).expect("hung")
+}
+
+fn srt_code(e: &std::io::Error) -> i32 {
+    match e.get_ref().and_then(|e| e.downcast_ref::<Error>()) {
+        Some(Error::SRTError { code, .. }) => *code,
+        _ => panic!("not an SRT error: {:?}", e),
+    }
+}
+
+#[test]
+fn killed_listener_thread_fails_accept_and_streams() {
+    let port = free_port();
+    let (listener, mut server, mut client) = pair(port, Some("k"));
+    client.write_all(b"before").unwrap();
+    let mut buf = [0u8; 64];
+    let n = server.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"before");
+    // a second caller, accepted by the thread but not yet by the application
+    let c2 = std::thread::spawn(move || Stream::connect(("127.0.0.1", port), &ConnectOptions::default()));
+    let mut c2 = c2.join().unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(lock(&listener.h.ls.st).q.len(), 1);
+    listener.h.ls.ctl.command(engine::Cmd::Panic);
+    let listener = within(5, move || {
+        // accept() errors at once (the queued stream is failed, not handed out)
+        match listener.accept() {
+            Err(Error::SRTError { fn_name, code, .. }) => assert_eq!((fn_name, code), ("srt_accept", 1003)),
+            Err(e) => panic!("{}", e),
+            Ok(_) => panic!("accepted after the I/O thread died"),
+        }
+        assert!(lock(&listener.h.ls.st).dead.as_deref().map_or(false, |d| d.starts_with("panicked")));
+        listener
+    });
+    // the accepted stream: read and write fail, never hang
+    let server = within(5, move || {
+        let e = server.read(&mut [0u8; 64]).unwrap_err();
+        assert_eq!(srt_code(&e), 1003, "{}", e);
+        assert_eq!(srt_code(&server.write(b"x").unwrap_err()), 1003);
+        server
+    });
+    // accept keeps failing (no spin inside the backend: it is the caller's loop)
+    assert!(listener.accept().is_err());
+    drop((server, listener));
+    let _ = c2.write(b"peer is gone");
+    drop(c2);
+}
+
+#[test]
+fn killed_caller_thread_fails_reads_and_writes() {
+    let port = free_port();
+    let (_listener, _server, client) = pair(port, None);
+    client.h.sh.ctl.command(engine::Cmd::Panic);
+    within(5, move || {
+        let mut client = client;
+        let e = client.read(&mut [0u8; 64]).unwrap_err();
+        assert_eq!(srt_code(&e), 1003, "{}", e);
+        assert_eq!(srt_code(&client.write(b"x").unwrap_err()), 1003);
+    });
+}
+
+#[test]
+fn callback_sees_empty_stream_id_and_bad_passphrase_rejects() {
+    use std::sync::{Arc, Mutex};
+    let port = free_port();
+    let logged: Arc<Mutex<Vec<String>>> = Arc::default();
+    let l2 = logged.clone();
+    set_log_handler(move |e: &SrtLogEvent| l2.lock().unwrap().extend(e.message.map(str::to_string)));
+    set_log_level(LogLevel::Warning);
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let s2 = seen.clone();
+    let listener = Listener::bind(("127.0.0.1", port))
+        .unwrap()
+        .with_callback(move |sid: Option<&str>| {
+            s2.lock().unwrap().push(sid.map(str::to_string));
+            match sid {
+                // libsrt rejects the caller when SRTO_PASSPHRASE cannot be set
+                Some("short") => ListenerCallbackAction::Allow {
+                    passphrase: Some("123456789".into()),
+                },
+                Some("long") => ListenerCallbackAction::Allow {
+                    passphrase: Some("p".repeat(81)),
+                },
+                _ => ListenerCallbackAction::Allow { passphrase: None },
+            }
+        })
+        .unwrap();
+    let t = std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        (s.id().cloned(), listener)
+    });
+    for sid in ["short", "long"] {
+        let o = ConnectOptions {
+            stream_id: Some(sid.into()),
+            passphrase: Some("p".repeat(10)),
+            ..Default::default()
+        };
+        match Stream::connect(("127.0.0.1", port), &o) {
+            Err(Error::SRTError { code, .. }) => assert_eq!(code, 1002, "{}", sid),
+            other => panic!("{}: {:?}", sid, other.map(|_| ())),
+        }
+    }
+    let c = Stream::connect(("127.0.0.1", port), &ConnectOptions::default()).unwrap();
+    let (id, _listener) = t.join().unwrap();
+    // no stream id: the callback gets Some("") (libsrt), the stream None
+    assert_eq!(id, None);
+    assert_eq!(c.id(), None);
+    let mut seen = seen.lock().unwrap().clone();
+    seen.dedup();
+    assert_eq!(seen, vec![Some("short".to_string()), Some("long".to_string()), Some(String::new())]);
+    // refused for the passphrase itself (not for a mismatch)
+    let bad = logged.lock().unwrap().iter().filter(|m| m.contains("outside 10..=80 bytes")).count();
+    assert!(bad >= 2, "{:?}", logged.lock().unwrap());
 }
 
 #[test]
@@ -414,6 +560,28 @@ mod async_tests {
         assert_eq!(&buf[..n], b"after listener drop");
         // new callers are not accepted any more
         assert!(AsyncStream::connect(("127.0.0.1", port), &ConnectOptions::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_killed_listener_thread_wakes_pending_read_and_accept() {
+        let port = free_port();
+        let listener = AsyncListener::bind(("127.0.0.1", port)).unwrap();
+        let (a, c) = join!(listener.accept(), AsyncStream::connect(("127.0.0.1", port), &DEFAULT));
+        let mut server = a.unwrap().0;
+        let _client = c.unwrap();
+        // the read is pending (its waker registered) when the thread dies
+        let read = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            server.read(&mut buf).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        listener.h.ls.ctl.command(engine::Cmd::Panic);
+        let e = tokio::time::timeout(Duration::from_secs(2), read).await.expect("read hung").unwrap().unwrap_err();
+        assert_eq!(srt_code(&e), 1003);
+        match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.expect("accept hung") {
+            Err(Error::SRTError { code, .. }) => assert_eq!(code, 1003),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
     }
 
     #[tokio::test]

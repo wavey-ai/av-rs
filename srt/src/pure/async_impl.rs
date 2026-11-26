@@ -16,7 +16,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub struct AsyncListener<'c> {
-    h: ListenerHandle,
+    pub(super) h: ListenerHandle,
     _cb: PhantomData<&'c ()>,
 }
 

@@ -75,3 +75,31 @@ and leaves accepted streams running.
   handled). No AES-GCM (libsrt 1.5.4+ `SRTO_CRYPTOMODE` 2).
 - Accepted-but-not-taken connections are limited to 10 (`srt_listen(s, 10)`);
   more callers are rejected with BACKLOG until `accept()` runs.
+- A zero or negative `ReceiveBufferSize` / `SendBufferSize` is clamped to the
+  32-packet minimum (libsrt refuses it with `srt_setsockopt error: 5003`).
+
+Behaviour matched to libsrt (not a difference, listed because it is easy to
+get wrong):
+
+- Passphrases (connect options and the callback's `Allow { passphrase }`)
+  are 10 to 80 bytes, or empty for none, as libsrt's `SRTO_PASSPHRASE`
+  (`HAICRYPT_SECRET_MAX_SZ` is 80; its documentation says 79). Outside that,
+  `connect` fails with `srt_setsockopt error: 5003` and a callback's
+  passphrase rejects the caller (reason 0) as libsrt's hook returning -1.
+  Stream ids are at most 512 bytes.
+- The callback gets `Some("")` when the caller sent no stream id (libsrt
+  passes its empty stream id buffer); `AsyncStream::id()` is then `None`.
+- Hostile input: datagrams longer than 1500 bytes are dropped (libsrt's
+  receive unit); a KM message must have exactly its length (as libsrt's
+  `hcryptCtx_Rx_ParseKM`), otherwise the caller is rejected with BADSECRET
+  or a key refresh answered with the BADSECRET state; cleartext data
+  (KK = 0) in an encrypted session is counted in `pkt_rcv_undecrypt` and
+  dropped, also when the FEC filter rebuilds it.
+- If an I/O thread ends unexpectedly (it should not; a panic is caught),
+  every stream it served fails with `srt_recv` / `srt_send` /
+  `srt_connect error: 1003` (SRT_ESOCKFAIL) and `accept()` returns
+  `srt_accept error: 1003` from then on: callers should stop or back off.
+- `Debug` of `ConnectOptions` and `srt_core::Config` prints the passphrase
+  as `<redacted>`; srt-core zeroes its copies of the passphrase and key
+  material when a connection is dropped (the AES key schedules inside the
+  `aes` crate and the application's own `String`s are not zeroed).

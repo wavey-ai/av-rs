@@ -124,15 +124,19 @@ pub(crate) fn listener_config(opts: impl IntoIterator<Item = ListenerOption>) ->
     Ok(cfg)
 }
 
+/// SRTO_PASSPHRASE as libsrt takes it: 10..=80 bytes, or empty for none;
+/// anything else fails as `srt_setsockopt` does (SRT_EINVPARAM).
+pub(crate) fn check_passphrase(p: Option<String>) -> Result<Option<String>> {
+    match p {
+        Some(p) if p.is_empty() => Ok(None),
+        Some(p) if p.len() < srt_core::config::PASSPHRASE_MIN || p.len() > srt_core::config::PASSPHRASE_MAX => Err(invalid("srt_setsockopt")),
+        p => Ok(p),
+    }
+}
+
 pub(crate) fn connect_config(o: &ConnectOptions) -> Result<Config> {
     let mut cfg = base_config();
-    if let Some(p) = &o.passphrase {
-        // libsrt accepts 10..=79 characters
-        if p.len() < 10 || p.len() > 79 {
-            return Err(invalid("srt_setsockopt"));
-        }
-        cfg.passphrase = Some(p.clone());
-    }
+    cfg.passphrase = check_passphrase(o.passphrase.clone())?;
     if let Some(s) = &o.stream_id {
         if s.len() > 512 {
             return Err(invalid("srt_setsockopt"));
