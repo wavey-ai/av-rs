@@ -51,11 +51,12 @@ pub struct Config {
     pub snd_drop_delay_ms: i32,
     /// [SRTO_DRIFTTRACER]
     pub drift_tracer: bool,
-    /// For this long after the TSBPD base is set (from the handshake
-    /// packet), a data packet that arrives earlier than the base predicts
-    /// moves the base back to it, so a delayed handshake (jitter) does not
-    /// delay every packet of the connection. 0 = off (libsrt's rule). Not
-    /// an SRT option (receiver timing).
+    /// Opt-in TSBPD settle, ms (0 = off: libsrt's rule, the base from the
+    /// handshake packet alone). For this long after the first data packet,
+    /// arrival offsets are sampled; then the base moves to their median if
+    /// that is later than the handshake base (never earlier: playout is
+    /// never earlier than libsrt's rule). See `Tsbpd::settle_for`. Not an
+    /// SRT option (receiver timing).
     pub tsbpd_settle_ms: u32,
     /// [SRTO_LOSSMAXTTL]: reorder tolerance in packets before a gap is
     /// NAKed (0 = NAK at once). Ours is also bounded in time by
@@ -133,7 +134,7 @@ impl Default for Config {
             tlpktdrop: true,
             snd_drop_delay_ms: 0,
             drift_tracer: true,
-            tsbpd_settle_ms: 1000,
+            tsbpd_settle_ms: 0,
             loss_max_ttl: 0,
             reorder_window_us: 2000,
             auto_reorder: true,

@@ -267,6 +267,9 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   ACK period (10 ms) made most tail probes toward libsrt duplicates.
   Sim: a peer ACKing ~20 ms after the newest packet, RTT 2 ms, 96 frames:
   96 tail probes before, 2 after; a lost tail is still repaired in time.
+- The hold-off part of the wait never pushes a probe past the last moment
+  its copy can still be played (origin + the peer's latency - 1 ms, as
+  `rexmit_too_late`); the probe never comes before one ACK period of wait.
 
 ## Reordering with LOSSMAXTTL 0 (rs2)
 
@@ -286,21 +289,50 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   srt-rs-fec, 25 Mbit/s, jitter 5 ms, 0 % loss sent 15337 retransmissions;
   sim (FEC 10x5 staircase, 0-10 ms jitter): 7115 -> 69.
 
-## TSBPD base settle (rs2)
+## TSBPD base settle (rs2, review A2)
 
-- The base comes from the handshake packet (`now - ts`, libsrt's rule). If
-  that packet was delayed (jitter, queueing), every packet plays that much
-  late for the whole connection; libsrt's drift tracer moves only after
-  1000 ACKACK samples and by at most 5 ms per step. For `tsbpd_settle_ms`
-  (default 1000) after the base is set, an original data packet arriving
-  earlier than the base predicts moves the base back to it (never later):
-  the base becomes the least-delayed one-way offset seen. The window opens
-  with the first data packet (an application may connect long before it
-  sends: the bench's T0 lead is ~5 s), and the total move is capped at
-  latency / 8 (on a jittery path the fastest packet is far below the mean
-  delay; every µs moved comes out of the slower packets' repair budget).
-  Bench: srt-rs-fec, 25 Mbit/s, jitter 5 ms: every frame 11.5 ms late
-  (0+360L) from one late handshake. Sim, handshake +12 ms: 147 -> 135.05 ms.
+- The base comes from the handshake packet (`now - ts`, libsrt's rule), and
+  that is the default (`tsbpd_settle_ms` 0). The handshake's delay is one
+  draw of the path's delay: a late one plays every packet that much later
+  until the drift tracer (1000 ACKACK samples, ~10 s) moves the base, as in
+  libsrt.
+- An earlier settle (rs2 v2/v3) moved the base to the fastest data packet
+  of the first second (capped at latency / 8). That played earlier than
+  libsrt ever would, so bench p99 verdicts measured the reference rather
+  than the transport, and the drift tracer reversed it ~10 s later with a
+  playout stall of up to latency / 8 (sim: 13.6 ms gap at t = 10 s).
+  Removed.
+- Opt-in (`tsbpd_settle_ms` > 0): for that long after the first data packet
+  the arrival offsets (arrival - base time) of original packets are sampled
+  (at most 1024, decimated to cover the window); then the base moves to
+  their median if that is *later* than the handshake base, never earlier,
+  and the drift average restarts from it. So playout is never earlier than
+  libsrt's rule; a fast handshake no longer takes the slower packets'
+  repair budget for 10 s (one stall of the move at the end of the window
+  instead of one when the drift tracer applies), and after the drift
+  tracer's first update both play at the same time. A late handshake is not
+  corrected (that would play earlier than libsrt). Sim:
+  `tsbpd_never_plays_before_the_handshake_rule`,
+  `drift_tracer_first_update_has_no_delivery_gap`.
+- Hole deadlines (re-NAK stop and spread) are kept without the TSBPD moves
+  made so far and get the current `Tsbpd::moved_us` (settle, drift; not the
+  wrap carry) added when used, so they follow later base moves.
+
+## Range validation (review A2)
+
+- Modular sequence order is not transitive: a NAK range can be first <
+  last and still straddle una ("first after una, last before it"). One
+  such 40-byte NAK was inserted whole (~7.5e8 sequences) and popped one at
+  a time by `poll_transmit` (5.5 s of CPU). NAK ranges are now checked by
+  offsets from una: off(first) <= off(last) < off(next_send), and at most
+  the send buffer long (libsrt rejects these, `list.cpp`); the part behind
+  una gets a DROPREQ, the rest is queued. A queued sequence the sender no
+  longer holds is removed with the whole part behind una, never per
+  sequence. DROPREQ ranges are checked by offsets from the delivery point
+  (both ends within 2^29, first <= last): a straddling one used to move the
+  highest received to the window's end, so later losses went unseen. ACK
+  values are compared by offsets from una too, and the loss counter's
+  highest sequence moves only within the receive window.
 
 ## srt-mio
 
@@ -330,6 +362,14 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
 - Pacing wakes `pace_quantum_us` (250 us) after the next packet is allowed,
   so each wake-up sends a batch; the pacer's 1 ms burst allowance keeps the
   configured rate.
+- A read stops after 1024 datagrams per drive; when it stops with
+  datagrams left, `poll_timeout` returns that drive's time, so the next
+  drive comes at once (no new readiness edge comes for them).
+- `UdpOptions::reuse_address` is off by default (libsrt never sets
+  SO_REUSEADDR); when on, it applies only to a fixed-port bind.
+- The stale-entry heap rebuild is `BinaryHeap::retain` (no allocation);
+  `coalesce_delay` uses the smallest SRTT of the connections (not the
+  first in map order).
 
 ## Interop rules kept in mind (spec)
 

@@ -31,7 +31,10 @@ pub(crate) struct Hole {
     /// Packets received (in total) when it was found, for LOSSMAXTTL.
     pub detected_at_pkt: u64,
     /// Delivery time of the packet that revealed it: TSBPD gives the run up
-    /// then (it is dropped when the next present packet is due).
+    /// then (it is dropped when the next present packet is due). Kept
+    /// without the TSBPD moves (settle, drift) since the handshake: the
+    /// deadline now is this + the current `Tsbpd::moved_us` (`NEVER`
+    /// stays `NEVER`).
     pub deadline_us: i64,
 }
 
@@ -335,6 +338,9 @@ impl RcvLossList {
     /// (libsrt's RETRANSMITALGO=1, whose queueing behind new data adds to
     /// the RTT) does not swallow one.
     ///
+    /// Deadlines are the stored ones + `deadline_shift_us` (the TSBPD
+    /// moves since the handshake), so they follow the base.
+    ///
     /// Returns the number of sequences listed and whether any run is a
     /// late attempt (NAKed before, or with no time for another round after
     /// this one). Also recomputes `next_due`.
@@ -347,6 +353,7 @@ impl RcvLossList {
         min_repair_us: i64,
         reserve_us: i64,
         max_words: usize,
+        deadline_shift_us: i64,
         out: &mut Vec<(u32, u32)>,
     ) -> (u64, bool) {
         out.clear();
@@ -358,7 +365,8 @@ impl RcvLossList {
         let n_ready = self.holes.len() - self.waiting;
         for h in self.holes.iter_mut().take(n_ready) {
             if h.next_nak_us <= limit {
-                if h.naks > 0 && now_us + min_repair_us > h.deadline_us {
+                let deadline = if h.deadline_us == NEVER { NEVER } else { h.deadline_us + deadline_shift_us };
+                if h.naks > 0 && now_us + min_repair_us > deadline {
                     h.next_nak_us = NEVER;
                     continue;
                 }
@@ -372,8 +380,8 @@ impl RcvLossList {
                 out.push((h.first, h.last));
                 seqs += h.len() as u64;
                 let mut iv = interval_us;
-                if reserve_us > 0 && h.deadline_us != NEVER && interval_us > 0 {
-                    let room = h.deadline_us - reserve_us - now_us;
+                if reserve_us > 0 && deadline != NEVER && interval_us > 0 {
+                    let room = deadline - reserve_us - now_us;
                     if room >= interval_us {
                         iv = room / (room / interval_us);
                     } else {
@@ -477,6 +485,11 @@ impl SndLossList {
         Some(s)
     }
 
+    /// Forget the lowest run (it lies outside what the sender holds).
+    pub fn drop_front_run(&mut self) {
+        self.runs.pop_front();
+    }
+
     /// Forget every sequence before `seq` (acknowledged or dropped).
     pub fn remove_before(&mut self, seq: u32) {
         while let Some(r) = self.runs.front_mut() {
@@ -563,7 +576,7 @@ mod tests {
             vec![(q(10), q(11)), (q(12), q(13)), (q(14), q(15)), (q(16), q(19)), (q(29), SEQ_MAX), (0, 2)]
         );
         let mut out = Vec::new();
-        let (n, _) = l.collect_due(3000, 0, 10_000, 0, 0, 100, &mut out);
+        let (n, _) = l.collect_due(3000, 0, 10_000, 0, 0, 100, 0, &mut out);
         assert_eq!((n, out), (7, vec![(q(12), q(13)), (q(14), q(15)), (0, 2)]));
         // NAKed runs are not touched; the rest is released
         assert_eq!(l.release_range(q(12), q(15), 4000, 0), 0);
@@ -619,23 +632,23 @@ mod tests {
         l.push(hole(30, 30, 5000), false);
         assert_eq!(l.next_due(), 1000);
         // at t=1000: two runs due (3 words), the third not yet
-        assert_eq!(l.collect_due(1000, 0, 40_000, 0, 0, 364, &mut out).0, 7);
+        assert_eq!(l.collect_due(1000, 0, 40_000, 0, 0, 364, 0, &mut out).0, 7);
         assert_eq!(out, vec![(10, 10), (20, 25)]);
         assert_eq!(l.next_due(), 5000);
-        assert_eq!(l.collect_due(5000, 0, 40_000, 0, 0, 364, &mut out).0, 1);
+        assert_eq!(l.collect_due(5000, 0, 40_000, 0, 0, 364, 0, &mut out).0, 1);
         assert_eq!(out, vec![(30, 30)]);
         assert_eq!(l.next_due(), 41_000);
         // word limit: only the single fits in 2 words after...
-        assert_eq!(l.collect_due(41_000, 0, 40_000, 0, 0, 2, &mut out).0, 1);
+        assert_eq!(l.collect_due(41_000, 0, 40_000, 0, 0, 2, 0, &mut out).0, 1);
         assert_eq!(out, vec![(10, 10)]);
         assert_eq!(l.next_due(), 41_000, "the run that did not fit stays due");
-        assert_eq!(l.collect_due(41_000, 4000, 40_000, 0, 0, 364, &mut out).0, 7);
+        assert_eq!(l.collect_due(41_000, 4000, 40_000, 0, 0, 364, 0, &mut out).0, 7);
         assert_eq!(out, vec![(20, 25), (30, 30)]);
         // a shorter interval brings the NAKed runs forward
         l.reschedule(20_000);
         assert_eq!(l.next_due(), 61_000);
         // deadline: no NAK when the repair cannot arrive in time
-        assert_eq!(l.collect_due(90_000, 0, 40_000, 30_000, 0, 364, &mut out).0, 0);
+        assert_eq!(l.collect_due(90_000, 0, 40_000, 30_000, 0, 364, 0, &mut out).0, 0);
         assert!(out.is_empty());
         assert_eq!(l.next_due(), NEVER);
     }
@@ -650,15 +663,15 @@ mod tests {
         h.deadline_us = 1_000_000;
         l.push(h, false);
         let (iv, rep, res) = (256_000, 250_000, 255_000);
-        assert_eq!(l.collect_due(0, 0, iv, rep, res, 364, &mut out).0, 1);
+        assert_eq!(l.collect_due(0, 0, iv, rep, res, 364, 0, &mut out).0, 1);
         // 745 ms of room: two more attempts, 372.5 ms apart (not 256)
         assert_eq!(l.next_due(), 372_500);
-        assert_eq!(l.collect_due(372_500, 0, iv, rep, res, 364, &mut out).0, 1);
+        assert_eq!(l.collect_due(372_500, 0, iv, rep, res, 364, 0, &mut out).0, 1);
         assert_eq!(l.next_due(), 745_000);
-        assert_eq!(l.collect_due(745_000, 0, iv, rep, res, 364, &mut out).0, 1);
+        assert_eq!(l.collect_due(745_000, 0, iv, rep, res, 364, 0, &mut out).0, 1);
         // no room for a fourth: it is scheduled at the plain interval and
         // then not sent (the repair could not arrive in time)
-        assert_eq!(l.collect_due(1_001_000, 0, iv, rep, res, 364, &mut out).0, 0);
+        assert_eq!(l.collect_due(1_001_000, 0, iv, rep, res, 364, 0, &mut out).0, 0);
         assert_eq!(l.next_due(), NEVER);
     }
 
@@ -672,20 +685,20 @@ mod tests {
         let mut h = hole(20, 22, 50);
         h.detected_at_pkt = 102;
         l.push(h, true);
-        assert_eq!(l.collect_due(10, 0, 1000, 0, 0, 364, &mut out).0, 0);
+        assert_eq!(l.collect_due(10, 0, 1000, 0, 0, 364, 0, &mut out).0, 0);
         // the second hole splits while waiting: both halves stay held
         l.fill(21);
         assert_eq!(l.snapshot(), vec![(10, 10), (20, 20), (22, 22)]);
         assert_eq!(l.release_waiting(100, 103, 3, 2000), 1);
         assert_eq!(l.oldest_waiting().unwrap().first, 20);
-        assert_eq!(l.collect_due(100, 0, 1000, 0, 0, 364, &mut out).0, 1);
+        assert_eq!(l.collect_due(100, 0, 1000, 0, 0, 364, 0, &mut out).0, 1);
         assert_eq!(out, vec![(10, 10)]);
         // time cap releases the rest
         assert_eq!(l.release_waiting(2050, 103, 3, 2000), 2);
         assert!(l.oldest_waiting().is_none());
         l.fill(22);
         // (10, 10) is due again (NAKed at 100, interval 1000)
-        assert_eq!(l.collect_due(2050, 0, 1000, 0, 0, 364, &mut out).0, 2);
+        assert_eq!(l.collect_due(2050, 0, 1000, 0, 0, 364, 0, &mut out).0, 2);
         assert_eq!(out, vec![(10, 10), (20, 20)]);
     }
 
