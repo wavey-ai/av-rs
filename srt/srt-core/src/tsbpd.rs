@@ -26,6 +26,10 @@ pub struct Tsbpd {
     /// Armed settle window (µs), opened by the first data packet: data may
     /// start long after the handshake (an application connects first).
     settle_window_us: Option<i64>,
+    /// How far the settle moved the base so far (capped at latency / 8: on
+    /// a jittery path the fastest packet can be well below the mean delay,
+    /// and every µs moved is taken from the repair budget of slower ones).
+    settled_us: i64,
 }
 
 impl Tsbpd {
@@ -43,6 +47,7 @@ impl Tsbpd {
             drift_tracer,
             settle_until_us: None,
             settle_window_us: None,
+            settled_us: 0,
         }
     }
 
@@ -70,9 +75,10 @@ impl Tsbpd {
         }
         match self.settle_until_us {
             Some(t) if arrival_us <= t => {
-                let early = self.base_time_us(ts) - arrival_us;
+                let early = (self.base_time_us(ts) - arrival_us).min(self.latency_us / 8 - self.settled_us);
                 if early > 0 {
                     self.base_us -= early;
+                    self.settled_us += early;
                     return early;
                 }
                 0
@@ -170,11 +176,20 @@ mod tests {
         assert_eq!(t.observe_arrival(1_500_000, 2_400_000), 0);
         assert_eq!(t.observe_arrival(1_600_000, 2_500_000), 0);
         // data that starts 5 s after the handshake still settles the base
-        let mut t = Tsbpd::new(1_012_000, 0, 100, false);
+        let mut t = Tsbpd::new(1_012_000, 0, 200, false);
         t.settle_for(1_012_000, 1_000_000);
         assert_eq!(t.observe_arrival(5_000_000, 6_000_000), 12_000);
         assert_eq!(t.observe_arrival(5_500_000, 6_499_000), 1_000);
         assert_eq!(t.observe_arrival(6_100_000, 7_090_000), 0);
+    }
+
+    #[test]
+    fn settle_is_capped_at_an_eighth_of_the_latency() {
+        let mut t = Tsbpd::new(1_030_000, 0, 120, false);
+        t.settle_for(1_030_000, 1_000_000);
+        // the fastest packet is 30 ms ahead of the base: only 15 ms are taken
+        assert_eq!(t.observe_arrival(10_000, 1_010_000), 15_000);
+        assert_eq!(t.observe_arrival(20_000, 1_015_000), 0);
     }
 
     #[test]

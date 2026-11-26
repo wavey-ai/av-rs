@@ -294,7 +294,11 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   1000 ACKACK samples and by at most 5 ms per step. For `tsbpd_settle_ms`
   (default 1000) after the base is set, an original data packet arriving
   earlier than the base predicts moves the base back to it (never later):
-  the base becomes the least-delayed one-way offset seen.
+  the base becomes the least-delayed one-way offset seen. The window opens
+  with the first data packet (an application may connect long before it
+  sends: the bench's T0 lead is ~5 s), and the total move is capped at
+  latency / 8 (on a jittery path the fastest packet is far below the mean
+  delay; every µs moved comes out of the slower packets' repair budget).
   Bench: srt-rs-fec, 25 Mbit/s, jitter 5 ms: every frame 11.5 ms late
   (0+360L) from one late handshake. Sim, handshake +12 ms: 147 -> 135.05 ms.
 
