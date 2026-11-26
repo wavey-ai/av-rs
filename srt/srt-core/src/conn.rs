@@ -27,8 +27,11 @@ const LIGHT_ACK_PKTS: u32 = 64;
 const ACK_WINDOW: usize = 1024;
 const INIT_RTT_US: u32 = 100_000;
 const INIT_RTTVAR_US: u32 = 50_000;
-/// Caller handshake re-send: first interval before an RTT is known, cap.
+/// Caller handshake re-send interval, fixed as libsrt's (at most one request
+/// per 250 ms, no back-off): on a path that drops in bursts, fewer re-sends
+/// leave the caller waiting longer for a packet to get through.
 const HS_FIRST_US: i64 = 250_000;
+/// Listener conclusion-response re-sends: first interval and cap.
 const HS_MIN_US: i64 = 100_000;
 const HS_MAX_US: i64 = 1_000_000;
 /// Listener: re-send the conclusion response until the caller is heard.
@@ -797,7 +800,7 @@ impl Connection {
                     return self.set_closed(CloseReason::Encrypted);
                 }
                 let rtt = (now_us - self.hs_sent_us).max(0);
-                self.hs_interval_us = (2 * rtt).clamp(HS_MIN_US, HS_MAX_US);
+                self.hs_interval_us = HS_FIRST_US;
                 if rtt > 0 && self.hs_sends == 1 {
                     // seed the timers (tail probe, re-NAK) until a real
                     // sample arrives; not reported as valid
@@ -1510,7 +1513,7 @@ impl Connection {
                 } else if now_us >= self.hs_next_us {
                     // re-send on the same socket, ID, ISN and port
                     self.hs_pending = true;
-                    self.hs_interval_us = (self.hs_interval_us * 2).min(HS_MAX_US);
+                    self.hs_interval_us = HS_FIRST_US;
                     self.hs_next_us = now_us + self.hs_interval_us;
                 }
             }

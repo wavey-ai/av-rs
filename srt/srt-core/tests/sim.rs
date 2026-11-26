@@ -353,8 +353,26 @@ fn connect_timeout_when_nobody_answers() {
     assert_eq!(s.caller.state(), &State::Closed(CloseReason::ConnectTimeout));
     let e = s.now - s.t0;
     assert!(e >= Duration::from_secs(3) && e < Duration::from_millis(3010));
-    // 250 ms, then doubling to 1 s: 0, 0.25, 0.75, 1.75, 2.75
-    assert_eq!(s.sent_a.len(), 5);
+    // every 250 ms as libsrt (no back-off): 0, 0.25, ..., 2.75
+    assert_eq!(s.sent_a.len(), 12);
+}
+
+#[test]
+fn handshake_keeps_250ms_resends_through_a_long_burst() {
+    // every caller handshake is lost for the first 3.1 s (a path stuck in
+    // a loss burst): the caller must get through at its next 250 ms
+    // re-send, as libsrt does, not after a backed-off 1 s interval
+    let ccfg = Config {
+        connect_timeout: Duration::from_secs(10),
+        ..cfg(120)
+    };
+    let mut s = Sim::new(ccfg, cfg(120), 1, 1);
+    let clock = s.clock.clone();
+    let t0 = s.t0;
+    s.drop = Box::new(move |side, _| side == "a" && clock.get() - t0 < Duration::from_millis(3100));
+    s.connect();
+    let e = s.now - s.t0;
+    assert!(e < Duration::from_millis(3300), "connected after {e:?}");
 }
 
 #[test]
