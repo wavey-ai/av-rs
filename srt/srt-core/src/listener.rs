@@ -25,6 +25,14 @@ pub struct AcceptRequest<'a> {
 /// for "forbidden", `App(1404)` for "not found").
 pub type AcceptCallback = Box<dyn FnMut(&AcceptRequest<'_>) -> Result<(), RejectReason> + Send>;
 
+/// Access control that may also choose the connection's passphrase:
+/// `Ok(Some(p))` uses `p`, `Ok(None)` the listener's `Config::passphrase`
+/// (libsrt: `srt_listen_callback` setting SRTO_PASSPHRASE on the new
+/// socket). A caller whose encryption does not match is rejected
+/// (BADSECRET for a wrong passphrase, UNSECURE when only one side
+/// encrypts), as libsrt with SRTO_ENFORCEDENCRYPTION.
+pub type AcceptSecretCallback = Box<dyn FnMut(&AcceptRequest<'_>) -> Result<Option<String>, RejectReason> + Send>;
+
 pub enum ListenerAction {
     /// Nothing to do.
     Ignore,
@@ -58,6 +66,7 @@ pub struct Listener {
     ids: HashSet<u32>,
     backlog_full: bool,
     accept_cb: Option<AcceptCallback>,
+    accept_secret_cb: Option<AcceptSecretCallback>,
     stats: ListenerStats,
 }
 
@@ -76,7 +85,8 @@ pub fn random_isn() -> u32 {
 
 /// Listener-side negotiation of a caller's conclusion.
 pub(crate) fn negotiate(cfg: &Config, hs: &Handshake) -> Result<Negotiated, RejectReason> {
-    if hs.kmreq || hs.encryption != 0 {
+    // encryption is settled once the passphrase is known (`Listener::handle`)
+    if !cfg!(feature = "aes") && (hs.kmreq || hs.encryption != 0) {
         return Err(RejectReason::Unsecure);
     }
     let Some(r) = hs.hsreq else { return Err(RejectReason::Rogue) };
@@ -117,7 +127,25 @@ pub(crate) fn negotiate(cfg: &Config, hs: &Handshake) -> Result<Negotiated, Reje
         snd_latency_ms: if tsbpd_rcv { cfg.peer_latency_ms.max(r.recv_delay_ms) } else { 0 },
         peer_flags: r.flags,
         peer_version: r.version,
+        #[cfg(feature = "aes")]
+        crypto: None,
     })
+}
+
+/// The connection's crypto from the caller's KMREQ and our passphrase.
+#[cfg(feature = "aes")]
+fn key_exchange(hs: &Handshake, secret: Option<&str>) -> Result<Option<Box<crate::crypto::Crypto>>, RejectReason> {
+    use crate::crypto::{Crypto, KmError};
+    match (hs.km_req.as_deref(), secret) {
+        (None, None) => Ok(None),
+        (Some(km), Some(p)) => match Crypto::from_km(p, km) {
+            Ok(c) => Ok(Some(Box::new(c))),
+            Err(KmError::BadSecret) => Err(RejectReason::BadSecret),
+            Err(_) => Err(RejectReason::Unsecure),
+        },
+        // only one side encrypts
+        _ => Err(RejectReason::Unsecure),
+    }
 }
 
 impl Listener {
@@ -131,6 +159,7 @@ impl Listener {
             ids: HashSet::new(),
             backlog_full: false,
             accept_cb: None,
+            accept_secret_cb: None,
             stats: ListenerStats::default(),
         }
     }
@@ -145,6 +174,12 @@ impl Listener {
 
     pub fn set_accept_callback(&mut self, cb: Option<AcceptCallback>) {
         self.accept_cb = cb;
+    }
+
+    /// Access control that also picks the passphrase (runs after the
+    /// plain callback, if both are set).
+    pub fn set_accept_secret_callback(&mut self, cb: Option<AcceptSecretCallback>) {
+        self.accept_secret_cb = cb;
     }
 
     /// While true, new callers are rejected with BACKLOG (1005).
@@ -255,19 +290,39 @@ impl Listener {
                 if self.backlog_full {
                     return self.reject(now, &hs, RejectReason::Backlog, out);
                 }
-                let n = match negotiate(&self.cfg, &hs) {
+                #[allow(unused_mut)]
+                let mut n = match negotiate(&self.cfg, &hs) {
                     Ok(n) => n,
                     Err(r) => return self.reject(now, &hs, r, out),
                 };
+                let rq = AcceptRequest {
+                    peer: from,
+                    stream_id: hs.stream_id.as_deref(),
+                    caller_socket_id: hs.socket_id,
+                };
                 if let Some(cb) = self.accept_cb.as_mut() {
-                    let rq = AcceptRequest {
-                        peer: from,
-                        stream_id: hs.stream_id.as_deref(),
-                        caller_socket_id: hs.socket_id,
-                    };
                     if let Err(r) = cb(&rq) {
                         return self.reject(now, &hs, r, out);
                     }
+                }
+                let mut secret = self.cfg.passphrase.clone();
+                if let Some(cb) = self.accept_secret_cb.as_mut() {
+                    match cb(&rq) {
+                        Ok(Some(p)) => secret = Some(p),
+                        Ok(None) => {}
+                        Err(r) => return self.reject(now, &hs, r, out),
+                    }
+                }
+                #[cfg(feature = "aes")]
+                match key_exchange(&hs, secret.as_deref()) {
+                    Ok(c) => n.crypto = c,
+                    Err(r) => return self.reject(now, &hs, r, out),
+                }
+                // without AES a passphrase can never be honoured: refuse
+                // rather than run unencrypted
+                #[cfg(not(feature = "aes"))]
+                if secret.is_some() {
+                    return self.reject(now, &hs, RejectReason::Unsecure, out);
                 }
                 let sid = self.new_sid();
                 let conn = Connection::accepted(self.cfg.clone(), now, from, sid, &hs, hdr.timestamp, n);

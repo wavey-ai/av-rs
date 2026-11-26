@@ -87,6 +87,13 @@ pub struct Config {
     /// probe), us; negative = auto (max(latency / 4, 10 ms)). Not an SRT
     /// option.
     pub fec_ack_head_delay_us: i32,
+    /// [SRTO_PASSPHRASE] (10..=79 bytes): encrypt the payload with AES-CTR
+    /// (needs the `aes` feature; without it a passphrase is refused by
+    /// `validate`). A listener's is the default for every caller (see
+    /// `Listener::set_accept_secret_callback`).
+    pub passphrase: Option<String>,
+    /// [SRTO_PBKEYLEN] 0 (16, or what the listener advertises), 16, 24, 32.
+    pub pbkeylen: u8,
 }
 
 impl Default for Config {
@@ -119,6 +126,8 @@ impl Default for Config {
             ack_rttvar_floor: true,
             pace_quantum_us: 250,
             fec_ack_head_delay_us: -1,
+            passphrase: None,
+            pbkeylen: 0,
         }
     }
 }
@@ -159,6 +168,17 @@ impl Config {
         }
         if self.rcv_buf_pkts < 32 || self.snd_buf_pkts < 32 {
             return Err("buffers must hold at least 32 packets");
+        }
+        if let Some(p) = &self.passphrase {
+            if p.len() < 10 || p.len() > 79 {
+                return Err("passphrase must be 10..=79 bytes");
+            }
+            if !cfg!(feature = "aes") {
+                return Err("a passphrase needs srt-core's `aes` feature");
+            }
+        }
+        if !matches!(self.pbkeylen, 0 | 16 | 24 | 32) {
+            return Err("pbkeylen must be 0, 16, 24 or 32");
         }
         Ok(())
     }

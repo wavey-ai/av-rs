@@ -123,6 +123,16 @@ impl SndBuf {
         Some(&self.pool.get(s.idx)[..HDR_LEN + s.len as usize])
     }
 
+    /// The encoded packet of a held sequence, writable (to encrypt it in place).
+    #[allow(dead_code)]
+    pub fn packet_mut(&mut self, seq: u32) -> Option<&mut [u8]> {
+        let s = self.slots[(seq & self.mask) as usize];
+        if s.idx == NONE || !self.holds(seq) {
+            return None;
+        }
+        Some(&mut self.pool.get_mut(s.idx)[..HDR_LEN + s.len as usize])
+    }
+
     /// Record a (re)transmission of a held sequence.
     #[inline]
     pub fn mark_sent(&mut self, seq: u32, now_us: i64) {

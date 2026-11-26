@@ -8,3 +8,14 @@ description = "Sans-IO SRT (Secure Reliable Transport) live-mode protocol engine
 repository = "https://github.com/wavey-ai/av-rs"
 
 [dependencies]
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+sha1 = { version = "0.10", default-features = false, optional = true }
+aes-kw = { version = "0.2", optional = true }
+getrandom = { version = "0.2", optional = true }
+
+[features]
+default = []
+# SRT payload encryption (AES-CTR, passphrase KM exchange), RustCrypto crates.
+aes = ["dep:aes", "dep:ctr", "dep:pbkdf2", "dep:sha1", "dep:aes-kw", "dep:getrandom"]

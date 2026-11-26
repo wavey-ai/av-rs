@@ -197,6 +197,11 @@ pub struct Handshake {
     pub kmreq: bool,
     /// A KMRSP block was present.
     pub kmrsp: bool,
+    /// The KMREQ block's bytes (a HaiCrypt KM message); encoded when set.
+    pub km_req: Option<Vec<u8>>,
+    /// The KMRSP block's bytes (the echoed KM message, or one word with a
+    /// KM state on failure); encoded when set.
+    pub km_rsp: Option<Vec<u8>>,
     pub group: bool,
 }
 
@@ -271,7 +276,7 @@ impl Handshake {
         if self.hsreq.is_some() || self.hsrsp.is_some() {
             f |= ext::HSREQ;
         }
-        if self.kmreq || self.kmrsp {
+        if self.kmreq || self.kmrsp || self.km_req.is_some() || self.km_rsp.is_some() {
             f |= ext::KMREQ;
         }
         if self.stream_id.is_some() || self.congestion.is_some() || self.filter.is_some() || self.group {
@@ -289,14 +294,18 @@ impl Handshake {
         if self.hsrsp.is_some() {
             n += 16;
         }
+        for k in [&self.km_req, &self.km_rsp].into_iter().flatten() {
+            n += 4 + (k.len() + 3) / 4 * 4;
+        }
         for s in [&self.stream_id, &self.congestion, &self.filter].into_iter().flatten() {
             n += 4 + (s.len() + 3) / 4 * 4;
         }
         n
     }
 
-    /// Encode the CIF (48 bytes + blocks in libsrt's order: HSREQ/HSRSP, SID,
-    /// CONGESTION, FILTER). KMREQ/GROUP are never emitted. Returns the length.
+    /// Encode the CIF (48 bytes + blocks: HSREQ/HSRSP, KMREQ/KMRSP when
+    /// `km_req`/`km_rsp` hold data, SID, CONGESTION, FILTER). GROUP is
+    /// never emitted. Returns the length.
     pub fn encode(&self, b: &mut [u8]) -> usize {
         wr32(b, 0, self.version);
         wr32(b, 4, ((self.encryption as u32) << 16) | self.ext_field as u32);
@@ -317,6 +326,16 @@ impl Handshake {
                 wr32(b, off + 8, e.flags);
                 wr32(b, off + 12, (e.recv_delay_ms as u32) << 16 | e.send_delay_ms as u32);
                 off += 16;
+            }
+        }
+        // KM messages are byte strings in network order: copied as they are
+        for (c, k) in [(cmd::KMREQ, &self.km_req), (cmd::KMRSP, &self.km_rsp)] {
+            if let Some(k) = k {
+                let words = (k.len() + 3) / 4;
+                b[off + 4..off + 4 + words * 4].fill(0);
+                b[off + 4..off + 4 + k.len()].copy_from_slice(k);
+                wr32(b, off, (c as u32) << 16 | words as u32);
+                off += 4 + words * 4;
             }
         }
         for (c, s) in [(cmd::SID, &self.stream_id), (cmd::CONGESTION, &self.congestion), (cmd::FILTER, &self.filter)] {
@@ -376,8 +395,14 @@ impl Handshake {
                         }
                     }
                 }
-                cmd::KMREQ => hs.kmreq = true,
-                cmd::KMRSP => hs.kmrsp = true,
+                cmd::KMREQ => {
+                    hs.kmreq = true;
+                    hs.km_req = Some(body.to_vec());
+                }
+                cmd::KMRSP => {
+                    hs.kmrsp = true;
+                    hs.km_rsp = Some(body.to_vec());
+                }
                 cmd::SID => hs.stream_id = Some(get_string(body)),
                 cmd::CONGESTION => hs.congestion = Some(get_string(body)),
                 cmd::FILTER => hs.filter = Some(get_string(body)),
@@ -457,5 +482,32 @@ mod tests {
         assert!(d.filter.is_none());
         assert!(d.hsreq.is_some());
         assert!(Handshake::decode(&b[..47]).is_none());
+    }
+
+    #[test]
+    fn km_blocks_round_trip() {
+        let km: Vec<u8> = (0u8..56).collect();
+        let hs = Handshake {
+            version: 5,
+            encryption: 2,
+            req_type: req::CONCLUSION,
+            hsreq: Some(SrtHsExt {
+                version: SRT_VERSION,
+                flags: flags::LIVE,
+                recv_delay_ms: 120,
+                send_delay_ms: 120,
+            }),
+            kmreq: true,
+            km_req: Some(km.clone()),
+            stream_id: Some("s".into()),
+            ..Default::default()
+        };
+        assert_eq!(hs.conclusion_ext_flags(), ext::HSREQ | ext::KMREQ | ext::CONFIG);
+        let mut b = [0u8; 256];
+        let n = hs.encode(&mut b);
+        assert_eq!(n, hs.encoded_len());
+        // the KM bytes appear on the wire unchanged after their block header
+        assert_eq!(&b[48 + 16 + 4..48 + 16 + 4 + 56], &km[..]);
+        assert_eq!(Handshake::decode(&b[..n]).unwrap(), hs);
     }
 }

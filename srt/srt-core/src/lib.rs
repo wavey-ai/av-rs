@@ -12,6 +12,8 @@
 
 pub mod config;
 pub mod conn;
+#[cfg(feature = "aes")]
+pub mod crypto;
 pub mod fec;
 pub mod filter;
 pub mod handshake;
@@ -28,5 +30,5 @@ pub mod tsbpd;
 pub use config::Config;
 pub use conn::{CloseReason, Connection, Delivered, Event, Role, SendError, State, Transmit};
 pub use handshake::RejectReason;
-pub use listener::{random_isn, random_socket_id, AcceptCallback, AcceptRequest, Listener, ListenerAction, ListenerStats};
+pub use listener::{random_isn, random_socket_id, AcceptCallback, AcceptRequest, AcceptSecretCallback, Listener, ListenerAction, ListenerStats};
 pub use stats::{DroppedHole, Snapshot, Stats};

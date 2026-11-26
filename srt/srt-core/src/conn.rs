@@ -158,10 +158,22 @@ pub(crate) struct Negotiated {
     pub snd_latency_ms: u16,
     pub peer_flags: u32,
     pub peer_version: u32,
+    /// Keys from the caller's KMREQ (feature `aes`).
+    #[cfg(feature = "aes")]
+    pub crypto: Option<Box<crate::crypto::Crypto>>,
 }
 
 pub struct Connection {
     cfg: Config,
+    /// Payload encryption (feature `aes`); None = clear.
+    #[cfg(feature = "aes")]
+    crypto: Option<Box<crate::crypto::Crypto>>,
+    /// A KMRSP (control, EXT) to send: the answer to a KMREQ key refresh.
+    #[cfg(feature = "aes")]
+    km_out: Option<Vec<u8>>,
+    /// Scratch for a decrypted payload.
+    #[cfg(feature = "aes")]
+    dec_buf: Vec<u8>,
     role: Role,
     state: State,
     epoch: Instant,
@@ -380,6 +392,12 @@ impl Connection {
             last_recv_us: 0,
             events: VecDeque::new(),
             stats: Stats::default(),
+            #[cfg(feature = "aes")]
+            crypto: None,
+            #[cfg(feature = "aes")]
+            km_out: None,
+            #[cfg(feature = "aes")]
+            dec_buf: Vec::new(),
             cfg,
         }
     }
@@ -407,6 +425,11 @@ impl Connection {
         c.hs_pending = true;
         c.hs_dst = 0;
         c.hs_next_us = HS_FIRST_US;
+        #[cfg(feature = "aes")]
+        if let Some(p) = c.cfg.passphrase.clone() {
+            let klen = if c.cfg.pbkeylen == 0 { 16 } else { c.cfg.pbkeylen as usize };
+            c.crypto = Some(Box::new(crate::crypto::Crypto::generate(&p, klen)));
+        }
         c
     }
 
@@ -426,6 +449,10 @@ impl Connection {
         c.peer_stream_id.clone_from(&caller.stream_id);
         c.tsbpd_rcv = c.cfg.tsbpd && n.peer_flags & flags::TSBPDSND != 0;
         c.tsbpd = Some(Tsbpd::new(0, hs_timestamp, n.rcv_latency_ms, c.cfg.drift_tracer));
+        #[cfg(feature = "aes")]
+        {
+            c.crypto = n.crypto.clone();
+        }
         let send_filter = n.filter.is_some() && n.peer_flags & flags::FILTERCAP != 0;
         c.filter = n.filter;
         c.setup_filter(); // the listener checked the config
@@ -449,6 +476,12 @@ impl Connection {
             filter: if send_filter { c.filter.clone() } else { None },
             ..Default::default()
         };
+        #[cfg(feature = "aes")]
+        if let Some(cr) = &c.crypto {
+            // HSv5: one key set for both directions; KMRSP echoes the KMREQ
+            rsp.encryption = cr.hs_field();
+            rsp.km_rsp = Some(cr.km_msg().to_vec());
+        }
         rsp.ext_field = rsp.conclusion_ext_flags();
         c.hs = Some(Box::new(rsp));
         c.hs_pending = true;
@@ -715,6 +748,8 @@ impl Connection {
                     Control::AckAck => self.on_ackack(now_us, hdr.info, hdr.timestamp),
                     Control::Shutdown => self.set_closed(CloseReason::PeerShutdown),
                     Control::DropReq { first, last } => self.on_dropreq(first, last),
+                    #[cfg(feature = "aes")]
+                    Control::Other { cif } if hdr.ctype == packet::ctrl::EXT && hdr.subtype == crate::handshake::cmd::KMREQ => self.on_kmreq(cif),
                     _ => self.stats.pkt_recv_other_ctrl += 1,
                 }
             }
@@ -750,7 +785,7 @@ impl Connection {
                 if hs.ext_field != HS_MAGIC {
                     return self.set_closed(CloseReason::Rejected(RejectReason::Rogue));
                 }
-                if hs.encryption != 0 {
+                if hs.encryption != 0 && !self.accept_listener_pbkeylen(hs.encryption) {
                     return self.set_closed(CloseReason::Encrypted);
                 }
                 let rtt = (now_us - self.hs_sent_us).max(0);
@@ -784,6 +819,11 @@ impl Connection {
                     filter: self.cfg.packet_filter.clone(),
                     ..Default::default()
                 };
+                #[cfg(feature = "aes")]
+                if let Some(cr) = &self.crypto {
+                    c.encryption = cr.hs_field();
+                    c.km_req = Some(cr.km_msg().to_vec());
+                }
                 c.ext_field = c.conclusion_ext_flags();
                 self.hs = Some(Box::new(c));
                 self.hs_pending = true;
@@ -808,6 +848,76 @@ impl Connection {
         }
     }
 
+    /// The listener advertised PBKEYLEN in its induction response: fine if
+    /// we encrypt (taking its key length unless ours is set).
+    #[cfg(feature = "aes")]
+    fn accept_listener_pbkeylen(&mut self, field: u16) -> bool {
+        let Some(cr) = &self.crypto else { return false };
+        match crate::crypto::Crypto::klen_from_hs_field(field) {
+            Some(k) if self.cfg.pbkeylen == 0 && k != cr.key_len() => {
+                let p = self.cfg.passphrase.clone().unwrap_or_default();
+                self.crypto = Some(Box::new(crate::crypto::Crypto::generate(&p, k)));
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    #[cfg(not(feature = "aes"))]
+    fn accept_listener_pbkeylen(&mut self, _field: u16) -> bool {
+        false
+    }
+
+    /// Caller: does the conclusion response settle encryption as we asked?
+    #[cfg(feature = "aes")]
+    fn check_km_response(&self, hs: &Handshake) -> Result<(), CloseReason> {
+        use crate::crypto::km_state;
+        match (&self.crypto, hs.km_rsp.as_deref()) {
+            (None, None) if hs.encryption == 0 => Ok(()),
+            (None, _) => Err(CloseReason::Encrypted),
+            (Some(c), Some(k)) if c.km_matches(k) => Ok(()),
+            (Some(_), Some(k)) if k.len() == 4 && packet::rd32(k, 0) == km_state::BADSECRET => Err(CloseReason::Rejected(RejectReason::BadSecret)),
+            (Some(_), _) => Err(CloseReason::Rejected(RejectReason::Unsecure)),
+        }
+    }
+
+    #[cfg(not(feature = "aes"))]
+    fn check_km_response(&self, hs: &Handshake) -> Result<(), CloseReason> {
+        if hs.encryption != 0 || hs.kmrsp {
+            Err(CloseReason::Encrypted)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A KMREQ while connected: the peer's sender announces (or switches
+    /// to) new keys. Answer with KMRSP: the same message, or our KM state.
+    #[cfg(feature = "aes")]
+    fn on_kmreq(&mut self, km: &[u8]) {
+        use crate::crypto::km_state;
+        let rsp = match self.crypto.as_mut() {
+            Some(c) => match c.refresh(km) {
+                Ok(()) => km.to_vec(),
+                Err(e) => e.state().to_be_bytes().to_vec(),
+            },
+            None => km_state::NOSECRET.to_be_bytes().to_vec(),
+        };
+        self.km_out = Some(rsp);
+    }
+
+    /// The payload is encrypted (AES-CTR, key length in bytes), if so.
+    pub fn encryption_key_len(&self) -> Option<usize> {
+        #[cfg(feature = "aes")]
+        {
+            self.crypto.as_ref().map(|c| c.key_len())
+        }
+        #[cfg(not(feature = "aes"))]
+        {
+            None
+        }
+    }
+
     fn complete_caller(&mut self, now_us: i64, ts: u32, hs: &Handshake) {
         let reject = |c: &mut Self, r| c.set_closed(CloseReason::Rejected(r));
         if hs.version != 5 {
@@ -816,8 +926,8 @@ impl Connection {
         if hs.mss > 1500 || hs.mss < 76 || hs.isn != self.isn || hs.flow_window < 2 {
             return reject(self, RejectReason::Rogue);
         }
-        if hs.encryption != 0 || hs.kmrsp {
-            return self.set_closed(CloseReason::Encrypted);
+        if let Err(r) = self.check_km_response(hs) {
+            return self.set_closed(r);
         }
         let Some(rsp) = hs.hsrsp else { return reject(self, RejectReason::Rogue) };
         if rsp.flags & flags::STREAM != 0 {
@@ -857,6 +967,33 @@ impl Connection {
             }
             return;
         }
+        #[cfg(feature = "aes")]
+        let mut dec = std::mem::take(&mut self.dec_buf);
+        #[cfg(feature = "aes")]
+        let plain: &[u8] = if hdr.key != 0 {
+            match &self.crypto {
+                Some(c) => {
+                    dec.clear();
+                    dec.extend_from_slice(payload);
+                    if !c.decrypt(hdr.key, hdr.seq, &mut dec) {
+                        st.pkt_rcv_undecrypt += 1;
+                        self.dec_buf = dec;
+                        return;
+                    }
+                    &dec
+                }
+                None => {
+                    st.pkt_rcv_undecrypt += 1;
+                    self.dec_buf = dec;
+                    return;
+                }
+            }
+        } else {
+            payload
+        };
+        #[cfg(not(feature = "aes"))]
+        let plain: &[u8] = payload;
+        #[cfg(not(feature = "aes"))]
         if hdr.key != 0 {
             // as libsrt without crypto: count it and drop it (one stray or
             // forged packet must not close the connection)
@@ -888,7 +1025,7 @@ impl Connection {
         if seq_off(self.rcv.base, hdr.seq) >= self.rcv.capacity() as i32 && self.rcv.len() == 0 && self.tsbpd_rcv && self.cfg.tlpktdrop {
             self.rcv_resync(hdr.seq);
         }
-        match self.rcv.insert(hdr.seq, payload, hdr.timestamp, hdr.msgno, hdr.rexmit) {
+        match self.rcv.insert(hdr.seq, plain, hdr.timestamp, hdr.msgno, hdr.rexmit) {
             Insert::Stored { loss, filled_hole } => {
                 if !hdr.rexmit {
                     self.last_data_ts = hdr.timestamp;
@@ -921,6 +1058,10 @@ impl Connection {
         if self.pkts_since_ack >= LIGHT_ACK_PKTS && self.ack_due.is_none() && self.rcv.ack != self.last_ack_seq {
             self.ack_due = Some(AckKind::Light);
             self.pkts_since_ack = 0;
+        }
+        #[cfg(feature = "aes")]
+        {
+            self.dec_buf = dec;
         }
     }
 
@@ -1002,7 +1143,28 @@ impl Connection {
     /// packet may complete its other group).
     fn fec_rebuild(&mut self, now_us: i64, rx: &mut FecRx) {
         while let Some(r) = rx.next_rebuild() {
-            if let Insert::Stored { loss, filled_hole } = self.rcv.insert(r.seq, rx.rebuilt(&r), r.timestamp, 1, false) {
+            // the filter works on what was sent (ciphertext); the buffer
+            // holds clear payloads
+            #[cfg(feature = "aes")]
+            let mut dec = std::mem::take(&mut self.dec_buf);
+            #[cfg(feature = "aes")]
+            let plain: &[u8] = match (&self.crypto, r.flags & 3) {
+                (Some(c), k) if k != 0 => {
+                    dec.clear();
+                    dec.extend_from_slice(rx.rebuilt(&r));
+                    c.decrypt(k, r.seq, &mut dec);
+                    &dec
+                }
+                _ => rx.rebuilt(&r),
+            };
+            #[cfg(not(feature = "aes"))]
+            let plain: &[u8] = rx.rebuilt(&r);
+            let ins = self.rcv.insert(r.seq, plain, r.timestamp, 1, false);
+            #[cfg(feature = "aes")]
+            {
+                self.dec_buf = dec;
+            }
+            if let Insert::Stored { loss, filled_hole } = ins {
                 self.stats.pkt_rcv_filter_supply += 1;
                 self.on_stored(now_us, r.seq, r.timestamp, r.len, false, true, loss, filled_hole);
                 rx.feed_rebuilt(&r);
@@ -1642,6 +1804,14 @@ impl Connection {
             self.stats.pkt_sent_keepalive += 1;
             return Some(packet::encode_keepalive(ts, self.peer_sid, buf));
         }
+        #[cfg(feature = "aes")]
+        if let Some(km) = self.km_out.take() {
+            let mut h = packet::ControlHeader::new(packet::ctrl::EXT, 0, ts, self.peer_sid);
+            h.subtype = crate::handshake::cmd::KMRSP;
+            h.encode(buf);
+            buf[HDR_LEN..HDR_LEN + km.len()].copy_from_slice(&km);
+            return Some(HDR_LEN + km.len());
+        }
         // retransmissions first: they are older than any new packet, so
         // their deadline is earlier (spec 12 #6); same pacer
         if let Some(seq) = self.rexmit_copy {
@@ -1879,6 +2049,13 @@ impl Connection {
         let ts = origin_us.max(0) as u64 as u32;
         match self.snd.push(data, ts, origin_us, self.peer_sid) {
             Ok(seq) => {
+                #[cfg(feature = "aes")]
+                if let Some(c) = &self.crypto {
+                    if let Some(p) = self.snd.packet_mut(seq) {
+                        let kk = c.encrypt(seq, &mut p[HDR_LEN..]);
+                        p[4] = (p[4] & !0x18) | (kk << 3);
+                    }
+                }
                 self.pacer.on_input(data.len(), now_us * 1000);
                 Ok(seq)
             }
