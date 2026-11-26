@@ -48,6 +48,8 @@ pub(crate) struct Filled {
     /// The run's NAK count and last NAK time before the fill.
     pub naks: u32,
     pub last_nak_us: i64,
+    /// When the run was found missing.
+    pub detected_us: i64,
 }
 
 #[derive(Default)]
@@ -155,6 +157,7 @@ impl RcvLossList {
         let out = Filled {
             naks: h.naks,
             last_nak_us: h.last_nak_us,
+            detected_us: h.detected_us,
         };
         self.seqs -= 1;
         if h.first == h.last {
@@ -255,11 +258,12 @@ impl RcvLossList {
     /// first NAK of the not yet NAKed sequences in it forward to `now_us`
     /// (runs are split so the rest keep waiting for FEC). Returns how many
     /// sequences were released.
-    pub fn release_range(&mut self, first: u32, last: u32, now_us: i64) -> u64 {
+    pub fn release_range(&mut self, first: u32, last: u32, now_us: i64, reorder_wait_us: i64) -> u64 {
         if seq_lt(last, first) {
             return 0;
         }
         let mut n = 0u64;
+        let mut due = NEVER;
         let mut i = self.holes.partition_point(|h| seq_lt(h.last, first));
         while i < self.holes.len() {
             let h = self.holes[i];
@@ -276,7 +280,11 @@ impl RcvLossList {
             let mut mid = h;
             mid.first = cut_first;
             mid.last = cut_last;
-            mid.next_nak_us = now_us;
+            // a reordering path: the packet may still come; wait that long
+            // after it was found missing (never past the hole's own cap)
+            let at = if reorder_wait_us > 0 { (h.detected_us + reorder_wait_us).max(now_us) } else { now_us };
+            mid.next_nak_us = at.min(h.next_nak_us);
+            due = due.min(mid.next_nak_us);
             if seq_lt(h.first, cut_first) {
                 self.holes[i].last = seq_dec(cut_first);
                 i += 1;
@@ -293,7 +301,7 @@ impl RcvLossList {
             i += 1;
         }
         if n > 0 {
-            self.next_due = self.next_due.min(now_us);
+            self.next_due = self.next_due.min(due);
         }
         n
     }
@@ -539,17 +547,17 @@ mod tests {
         l.push(hole(q(29), q(33), LATER), false);
         assert_eq!(l.next_due(), LATER);
         // the middle of a run: split in three
-        assert_eq!(l.release_range(q(12), q(13), 1000), 2);
+        assert_eq!(l.release_range(q(12), q(13), 1000, 0), 2);
         assert_eq!(l.snapshot(), vec![(q(10), q(11)), (q(12), q(13)), (q(14), q(19)), (q(29), q(33))]);
         assert_eq!(l.next_due(), 1000);
         // overlapping a released run: only the new part counts
-        assert_eq!(l.release_range(q(13), q(15), 2000), 2);
+        assert_eq!(l.release_range(q(13), q(15), 2000, 0), 2);
         assert_eq!(
             l.snapshot(),
             vec![(q(10), q(11)), (q(12), q(13)), (q(14), q(15)), (q(16), q(19)), (q(29), q(33))]
         );
         // the tail of a run, across the wrap
-        assert_eq!(l.release_range(0, 2, 3000), 3);
+        assert_eq!(l.release_range(0, 2, 3000, 0), 3);
         assert_eq!(
             l.snapshot(),
             vec![(q(10), q(11)), (q(12), q(13)), (q(14), q(15)), (q(16), q(19)), (q(29), SEQ_MAX), (0, 2)]
@@ -558,9 +566,9 @@ mod tests {
         let (n, _) = l.collect_due(3000, 0, 10_000, 0, 0, 100, &mut out);
         assert_eq!((n, out), (7, vec![(q(12), q(13)), (q(14), q(15)), (0, 2)]));
         // NAKed runs are not touched; the rest is released
-        assert_eq!(l.release_range(q(12), q(15), 4000), 0);
+        assert_eq!(l.release_range(q(12), q(15), 4000, 0), 0);
         assert_eq!(l.seqs(), 15);
-        assert_eq!(l.release_range(q(0), 100, 5000), 2 + 4 + 2);
+        assert_eq!(l.release_range(q(0), 100, 5000, 0), 2 + 4 + 2);
     }
 
     #[test]

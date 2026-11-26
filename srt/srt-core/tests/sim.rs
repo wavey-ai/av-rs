@@ -27,6 +27,8 @@ struct Sim {
     delay: DelayFn,
     sent_a: Vec<Vec<u8>>,
     sent_b: Vec<Vec<u8>>,
+    /// Sim time, readable from drop/delay closures.
+    clock: std::rc::Rc<std::cell::Cell<Instant>>,
 }
 
 impl Sim {
@@ -49,6 +51,7 @@ impl Sim {
             delay: Box::new(|_, _| Duration::ZERO),
             sent_a: Vec::new(),
             sent_b: Vec::new(),
+            clock: std::rc::Rc::new(std::cell::Cell::new(t0)),
         }
     }
 
@@ -61,6 +64,7 @@ impl Sim {
     fn step(&mut self) {
         self.now += STEP;
         let now = self.now;
+        self.clock.set(now);
         let mut due = Vec::new();
         self.wire.retain(|(t, to, d)| {
             if *t <= now {
@@ -1431,4 +1435,305 @@ fn data_with_a_key_is_dropped_not_fatal() {
     assert_eq!(s.conn().stats().pkt_rcv_undecrypt, 1);
     let (_, missing) = run_frames(&mut s, 3, 10, Duration::from_millis(20), Duration::from_millis(300));
     assert_eq!(missing, 0);
+}
+
+/// A peer that ACKs late (libsrt's receive worker idles between frames:
+/// the ACK for a frame's tail can come ~20 ms after it): ACKs pass only
+/// ~20 ms after the newest data packet, so RTT samples stay true but the tail's ACK is late.
+/// With the measured hold-off (`probe_ack_lag`) the tail probe stops firing
+/// on every frame; a lost tail is still repaired well within the latency.
+fn slow_ack_run(probe_ack_lag: bool, lose_tail_of: Option<u32>) -> (srt_core::Stats, srt_core::Stats, usize, Vec<Duration>) {
+    let mut ccfg = cfg(120);
+    ccfg.probe_ack_lag = probe_ack_lag;
+    let mut s = Sim::new(ccfg, cfg(120), 1, 1000);
+    s.connect();
+    let clock = s.clock.clone();
+    let mut last_data: Option<Instant> = None;
+    let mut lost = false;
+    s.drop = Box::new(move |side, d| {
+        let now = clock.get();
+        if side == "a" && data_seq(d).is_some() {
+            last_data = Some(now);
+        }
+        if side == "b" && ctl_type(d) == Some(2) {
+            // an ACK made within 18 ms of the newest data packet is lost:
+            // the one that passes comes ~20 ms after a frame's tail
+            return last_data.map_or(false, |t| now < t + Duration::from_millis(18));
+        }
+        if let (Some(f), "a", Some(q)) = (lose_tail_of, side, data_seq(d)) {
+            if q == 1000 + 20 * (f + 1) - 1 && !lost {
+                lost = true;
+                return true;
+            }
+        }
+        false
+    });
+    let (lat, missing) = run_frames(&mut s, 96, 20, Duration::from_micros(41_667), Duration::from_millis(500));
+    (s.caller.stats().clone(), s.conn().stats().clone(), missing, lat)
+}
+
+#[test]
+fn probes_wait_for_a_slow_acking_peer() {
+    let (old, _, m0, _) = slow_ack_run(false, None);
+    let (new, rcv, m1, _) = slow_ack_run(true, None);
+    eprintln!("probes without {} with {} dup {}", old.pkt_tail_probe, new.pkt_tail_probe, rcv.pkt_rcv_duplicate);
+    assert_eq!((m0, m1), (0, 0));
+    // one ACK period of wait: most frames' tails are probed for nothing
+    assert!(old.pkt_tail_probe >= 20, "without the hold-off: {}", old.pkt_tail_probe);
+    // measured hold-off: a few probes while it is learnt
+    assert!(new.pkt_tail_probe * 5 <= old.pkt_tail_probe, "with: {} without: {}", new.pkt_tail_probe, old.pkt_tail_probe);
+    assert!(rcv.pkt_rcv_duplicate <= new.pkt_tail_probe + new.pkt_head_probe, "{rcv:?}");
+}
+
+#[test]
+fn lost_tail_is_still_repaired_with_a_slow_acking_peer() {
+    let (c, r, missing, lat) = slow_ack_run(true, Some(60));
+    assert_eq!(missing, 0, "{c:?}\n{r:?}");
+    assert_eq!(r.pkt_rcv_drop, 0);
+    assert!(lat.iter().all(|l| *l <= Duration::from_micros(121_500)), "{:?}", lat.iter().max());
+}
+
+/// Frames lost (any packet missing or later than `deadline`) for `frames`
+/// bursts of `per` packets every 41.667 ms, random loss `pct` both ways.
+#[allow(clippy::too_many_arguments)]
+fn weak_case(ccfg: Config, lcfg: Config, owd_us: u64, pct: f64, per: usize, frames: usize, seed: u64, deadline: Duration) -> (usize, srt_core::Stats, srt_core::Stats) {
+    let mut s = Sim::new(ccfg, lcfg, 0, 9);
+    s.owd = Duration::from_micros(owd_us);
+    s.connect();
+    let mut rng = Rng(seed);
+    s.drop = Box::new(move |_, _| rng.chance(pct));
+    let mut sent_at: Vec<Instant> = Vec::new();
+    let mut ok = std::collections::HashSet::new();
+    let interval = Duration::from_micros(41_667);
+    let mut next = s.now;
+    let mut nf = 0;
+    s.run_until(interval * frames as u32 + Duration::from_millis(1500), |s| {
+        if nf < frames && s.now >= next {
+            for _ in 0..per {
+                let i = sent_at.len() as u32;
+                s.caller.send_message(s.now, &vmsg(i), None).unwrap();
+                sent_at.push(s.now);
+            }
+            nf += 1;
+            next += interval;
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            let i = u32::from_be_bytes(m.payload[..4].try_into().unwrap()) as usize;
+            if now - sent_at[i] <= deadline {
+                ok.insert(i);
+            }
+        }
+        false
+    });
+    let lost = (0..frames).filter(|f| (f * per..(f + 1) * per).any(|i| !ok.contains(&i))).count();
+    (lost, s.caller.stats().clone(), s.conn().stats().clone())
+}
+
+/// Exploration (not a pass/fail bar): the cells where libsrt is weakest,
+/// RTT 1 ms / L 40 ms at 5 % loss on every datagram both ways, ~166 Mbit/s
+/// (660 packets per 24 fps frame), 240 frames; plain ARQ and FEC 10x5
+/// staircase onreq. libsrt on Linode: 70+18L (plain), 98 (FEC) of 360.
+/// `cargo test --release --test sim weak_ -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn weak_rtt1_l40_5pct() {
+    let dl = Duration::from_millis(40 + 1 + 10);
+    for seed in [1u64, 2, 3] {
+        let (l, c, r) = weak_case(cfg(40), cfg(40), 500, 5.0, 660, 240, 0x5EED_0000 + seed, dl);
+        eprintln!("plain seed {seed}: frames lost {l}/240; rcv loss {} drop {} naks {} | snd retrans {} copies {} suppressed {} too-late {} probes t{} h{}",
+            r.pkt_rcv_loss, r.pkt_rcv_drop, r.pkt_sent_nak, c.pkt_retrans, c.pkt_rexmit_copies, c.pkt_rexmit_suppressed, c.pkt_rexmit_too_late, c.pkt_tail_probe, c.pkt_head_probe);
+        let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+        let (l, c, r) = weak_case(fcfg(40, f), fcfg(40, f), 500, 5.0, 660, 240, 0x5EED_0000 + seed, dl);
+        eprintln!("fec   seed {seed}: frames lost {l}/240; rcv loss {} drop {} supply {} filterloss {} naks {} | snd retrans {} copies {} stall {}",
+            r.pkt_rcv_loss, r.pkt_rcv_drop, r.pkt_rcv_filter_supply, r.pkt_rcv_filter_loss, r.pkt_sent_nak, c.pkt_retrans, c.pkt_rexmit_copies, c.pkt_stall_probe);
+    }
+}
+
+/// Exploration: set C (81.5 Mbit/s, ~322 packets per frame), small buffers.
+/// libsrt on Linode, frames lost of 360: RTT 30 / 1 %: L45 28+6L, L75 11;
+/// 5 %: L45 275+4L, L75 134, L120 20, L180 4. RTT 250 / 5 %: L375 214, L625 64.
+#[test]
+#[ignore]
+fn weak_set_c_small_buffers() {
+    for (rtt, pct, lat) in [(30u64, 1.0, 45u16), (30, 1.0, 75), (30, 5.0, 45), (30, 5.0, 75), (30, 5.0, 120), (30, 5.0, 180), (250, 5.0, 375), (250, 5.0, 625)] {
+        let dl = Duration::from_millis(lat as u64 + rtt / 2 + 10);
+        let (l, c, r) = weak_case(cfg(lat), cfg(lat), rtt * 500, pct, 322, 240, 0xC0FFEE, dl);
+        eprintln!("rtt {rtt} loss {pct}% L {lat}: frames lost {l}/240; rcv loss {} drop {} | snd retrans {} copies {} too-late {} tail {} head {} ackrexmit {} suppressed {}",
+            r.pkt_rcv_loss, r.pkt_rcv_drop, c.pkt_retrans, c.pkt_rexmit_copies, c.pkt_rexmit_too_late, c.pkt_tail_probe, c.pkt_head_probe, c.pkt_ack_rexmit, c.pkt_rexmit_suppressed);
+    }
+}
+
+fn jitter_run(auto: bool, pct: f64, seed: u64) -> (usize, srt_core::Stats, srt_core::Stats) {
+    jitter_run_f(auto, pct, seed, None)
+}
+
+fn jitter_run_f(auto: bool, pct: f64, seed: u64, filter: Option<&str>) -> (usize, srt_core::Stats, srt_core::Stats) {
+    let mut lcfg = cfg(120);
+    let mut ccfg = cfg(120);
+    if let Some(f) = filter {
+        lcfg = fcfg(120, f);
+        ccfg = fcfg(120, f);
+    }
+    lcfg.auto_reorder = auto;
+    let mut s = Sim::new(ccfg, lcfg, 15, 21);
+    s.connect();
+    let mut rng = Rng(seed);
+    let mut rng2 = Rng(seed ^ 0xABCD);
+    s.drop = Box::new(move |_, _| rng.chance(pct));
+    // data from the caller: 0-10 ms extra delay, uniform (netem jitter reorders)
+    s.delay = Box::new(move |side, d| if side == "a" && data_seq(d).is_some() { Duration::from_micros(rng2.next() % 10_000) } else { Duration::ZERO });
+    let (_, missing) = run_frames(&mut s, 96, 100, Duration::from_micros(41_667), Duration::from_millis(600));
+    (missing, s.caller.stats().clone(), s.conn().stats().clone())
+}
+
+/// Jitter with LOSSMAXTTL 0: once the path is seen to reorder, holes wait the
+/// observed lateness before their first NAK (auto_reorder): far fewer NAKs
+/// and needless retransmissions, and still no loss (with 1 % real loss too).
+#[test]
+fn auto_reorder_cuts_spurious_naks_under_jitter() {
+    for pct in [0.0, 1.0] {
+        let (m0, c0, r0) = jitter_run(false, pct, 77);
+        let (m1, c1, r1) = jitter_run(true, pct, 77);
+        eprintln!("loss {pct}%: off: naks {} retrans {} dup {} | auto: naks {} retrans {} dup {} reordered {}",
+            r0.nak_seqs_sent, c0.pkt_retrans, r0.pkt_rcv_duplicate, r1.nak_seqs_sent, c1.pkt_retrans, r1.pkt_rcv_duplicate, r1.pkt_rcv_reordered);
+        assert_eq!((m0, m1), (0, 0), "loss {pct}");
+        assert!(r1.pkt_rcv_reordered > 100);
+        assert!(c1.pkt_retrans * 20 < c0.pkt_retrans, "auto {} off {}", c1.pkt_retrans, c0.pkt_retrans);
+    }
+}
+
+/// Row FEC without ARQ at random loss: every data packet that was the only
+/// loss of its row (20 data + 1 FEC) must be rebuilt, every other loss must
+/// stay missing. Checks the receiver against the row arithmetic, packet by
+/// packet (the bench saw ~10 % more unrecovered losses than libsrt).
+fn row_fec_check(per: usize, frames: usize, pct: f64, fixed: bool, seed: u64) {
+    let f = "fec,cols:20,rows:1,arq:never";
+    let isn = 1000u32;
+    let mut s = Sim::new(fcfg(120, f), fcfg(120, f), 15, isn);
+    s.connect();
+    let dropped: std::rc::Rc<std::cell::RefCell<(Vec<u32>, Vec<u32>)>> = Default::default();
+    let dd = dropped.clone();
+    let mut rng = Rng(seed);
+    s.drop = Box::new(move |side, d| {
+        if side != "a" {
+            return false;
+        }
+        let Some(q) = data_seq(d) else { return false };
+        if rng.chance(pct) {
+            if is_fec(d) {
+                dd.borrow_mut().1.push(q);
+            } else {
+                dd.borrow_mut().0.push(q);
+            }
+            return true;
+        }
+        false
+    });
+    let mut sent_at: Vec<Instant> = Vec::new();
+    let mut got = std::collections::HashSet::new();
+    let interval = Duration::from_micros(41_667);
+    let mut next = s.now;
+    let mut nf = 0;
+    s.run_until(interval * frames as u32 + Duration::from_millis(600), |s| {
+        if nf < frames && s.now >= next {
+            for _ in 0..per {
+                let i = sent_at.len() as u32;
+                let m = if fixed { let mut m = vec![0x47u8; 1316]; m[..4].copy_from_slice(&i.to_be_bytes()); m } else { vmsg(i) };
+                s.caller.send_message(s.now, &m, None).unwrap();
+                sent_at.push(s.now);
+            }
+            nf += 1;
+            next += interval;
+        }
+        let now = s.now;
+        while let Some(m) = s.conn().recv_message(now) {
+            got.insert(u32::from_be_bytes(m.payload[..4].try_into().unwrap()));
+        }
+        false
+    });
+    let (data_lost, fec_lost) = dropped.borrow().clone();
+    let total = sent_at.len() as u32;
+    let row = |q: u32| (q - isn) / 20;
+    let mut lost_in_row = std::collections::HashMap::<u32, u32>::new();
+    for &q in &data_lost {
+        *lost_in_row.entry(row(q)).or_default() += 1;
+    }
+    for &q in &fec_lost {
+        *lost_in_row.entry(row(q)).or_default() += 1; // a FEC packet carries its row's last seq
+    }
+    let last_row = (total - 1) / 20;
+    let mut should_rebuild = 0;
+    let mut missed = Vec::new();
+    let mut extra = 0;
+    for &q in &data_lost {
+        let i = q - isn;
+        let r = row(q);
+        let recoverable = lost_in_row[&r] == 1 && r < last_row;
+        if recoverable {
+            should_rebuild += 1;
+            if !got.contains(&i) {
+                missed.push(q);
+            }
+        } else if got.contains(&i) {
+            extra += 1;
+        }
+    }
+    let st = s.conn().stats().clone();
+    eprintln!("data lost {} fec lost {} should rebuild {} missed {} extra {} supply {}", data_lost.len(), fec_lost.len(), should_rebuild, missed.len(), extra, st.pkt_rcv_filter_supply);
+    assert!(missed.is_empty(), "rebuildable losses not rebuilt: {:?} (of {should_rebuild})", &missed[..missed.len().min(20)]);
+    assert_eq!(extra, 0);
+}
+
+#[test]
+fn fec_row_arq_never_rebuilds_every_single_loss_row() {
+    row_fec_check(330, 120, 2.0, false, 0xFEC0_0001);
+    // the bench's shape: 1316-byte payloads, 657 per frame (166 Mbit/s)
+    row_fec_check(657, 120, 1.0, true, 0xFEC0_0002);
+}
+
+/// The handshake that sets the receiver's TSBPD base came 12 ms late
+/// (jitter): with `tsbpd_settle_ms` the first data packets move the base
+/// back, so packets play at origin + owd + latency; without it (libsrt's
+/// rule) every packet plays 12 ms late for the whole connection.
+#[test]
+fn tsbpd_base_settles_after_a_delayed_handshake() {
+    let run = |settle: u32| {
+        let mut l = cfg(120);
+        l.tsbpd_settle_ms = settle;
+        let mut s = Sim::new(cfg(120), l, 15, 300);
+        s.delay = Box::new(|side, d| if side == "a" && ctl_type(d) == Some(0) { Duration::from_millis(12) } else { Duration::ZERO });
+        s.connect();
+        // the application starts sending 3 s after connecting (the bench's T0 lead):
+        // the settle window opens with the first data packet, not at the handshake
+        s.run_until(Duration::from_secs(3), |_| false);
+        let (lat, missing) = run_frames(&mut s, 30, 20, Duration::from_millis(40), Duration::from_millis(400));
+        assert_eq!(missing, 0);
+        let max = *lat.iter().max().unwrap();
+        let min = *lat.iter().min().unwrap();
+        (min, max, s.conn().stats().us_tsbpd_settled)
+    };
+    let (min0, max0, _) = run(0);
+    let (min1, max1, moved) = run(1000);
+    eprintln!("no settle: {min0:?}..{max0:?}; settle: {min1:?}..{max1:?}, moved {moved} us");
+    assert!(min0 >= Duration::from_micros(146_900), "{min0:?}");
+    assert!(max1 <= Duration::from_micros(135_300) && min1 >= Duration::from_micros(134_900), "{min1:?}..{max1:?}");
+    assert!((11_500..=12_500).contains(&moved), "{moved}");
+}
+
+/// The same with FEC 10x5 staircase onreq: a group closes while its
+/// "missing" packet is only late, and the filter releases it for a NAK at
+/// once; with auto_reorder the released hole waits the observed reorder
+/// lateness first.
+#[test]
+fn auto_reorder_with_fec_cuts_spurious_naks_under_jitter() {
+    let f = "fec,cols:10,rows:5,layout:staircase,arq:onreq";
+    for pct in [0.0, 1.0] {
+        let (m0, c0, r0) = jitter_run_f(false, pct, 78, Some(f));
+        let (m1, c1, r1) = jitter_run_f(true, pct, 78, Some(f));
+        eprintln!("fec loss {pct}%: off: naks {} retrans {} | auto: naks {} retrans {} reordered {} supply {}",
+            r0.nak_seqs_sent, c0.pkt_retrans, r1.nak_seqs_sent, c1.pkt_retrans, r1.pkt_rcv_reordered, r1.pkt_rcv_filter_supply);
+        assert_eq!((m0, m1), (0, 0), "loss {pct}");
+        assert!(c1.pkt_retrans * 4 < c0.pkt_retrans, "auto {} off {}", c1.pkt_retrans, c0.pkt_retrans);
+    }
 }

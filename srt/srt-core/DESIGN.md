@@ -252,6 +252,56 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   delay) is skipped (`pktRexmitTooLate`); a probe of such a head is given
   up rather than retried.
 
+## Probes and a slow-ACKing peer (rs2)
+
+- Tail, head and stall probes wait, beyond the round trip, the peer's
+  measured ACK hold-off instead of one ACK period (`probe_ack_lag`,
+  default on). Sample: on an ACK advancing the window, the newest packet
+  it covers that was sent once (the one before a tail-probed packet)
+  waited `now - last send - SRTT` for it; skipped when a retransmission
+  for a hole (NAK, ACK-head, head or stall probe; tail probes do not
+  count) may lie in the acknowledged range, since a hole held that ACK.
+  The hold-off is the maximum over the current and the previous 1 s
+  window, capped at latency / 2, at least 10 ms. libsrt's receive worker
+  ACKs a frame's tail up to ~20 ms late when idle between frames, so one
+  ACK period (10 ms) made most tail probes toward libsrt duplicates.
+  Sim: a peer ACKing ~20 ms after the newest packet, RTT 2 ms, 96 frames:
+  96 tail probes before, 2 after; a lost tail is still repaired in time.
+
+## Reordering with LOSSMAXTTL 0 (rs2)
+
+- `auto_reorder` (default on, receiver timing only): with LOSSMAXTTL 0 a
+  reordered packet is NAKed at once and retransmitted for nothing. When an
+  original (R = 0) packet fills a hole, its lateness (arrival - detection)
+  + 0.5 ms is kept as a max over two 1 s windows; new holes then wait that
+  long before their first NAK (the LOSSMAXTTL waiting suffix, time-bound
+  only), capped at min(latency / 8, max(SRTT / 2, 2 ms)). No reordering for
+  2 s: back to NAK at once. LOSSMAXTTL > 0 keeps its own rule.
+  Sim, 0-10 ms uniform jitter on data, RTT 30, L 120, 9600 packets:
+  9056 needless retransmissions without, 66 with; with 1 % loss also no
+  frame lost.
+- With FEC (`onreq`/`always`) a group closes while its "missing" packet is
+  only late; a hole the filter releases then waits the same reorder wait
+  after its detection (never past its cap) before its first NAK. Bench:
+  srt-rs-fec, 25 Mbit/s, jitter 5 ms, 0 % loss sent 15337 retransmissions;
+  sim (FEC 10x5 staircase, 0-10 ms jitter): 7115 -> 69.
+
+## TSBPD base settle (rs2)
+
+- The base comes from the handshake packet (`now - ts`, libsrt's rule). If
+  that packet was delayed (jitter, queueing), every packet plays that much
+  late for the whole connection; libsrt's drift tracer moves only after
+  1000 ACKACK samples and by at most 5 ms per step. For `tsbpd_settle_ms`
+  (default 1000) after the base is set, an original data packet arriving
+  earlier than the base predicts moves the base back to it (never later):
+  the base becomes the least-delayed one-way offset seen. The window opens
+  with the first data packet (an application may connect long before it
+  sends: the bench's T0 lead is ~5 s), and the total move is capped at
+  latency / 8 (on a jittery path the fastest packet is far below the mean
+  delay; every µs moved comes out of the slower packets' repair budget).
+  Bench: srt-rs-fec, 25 Mbit/s, jitter 5 ms: every frame 11.5 ms late
+  (0+360L) from one late handshake. Sim, handshake +12 ms: 147 -> 135.05 ms.
+
 ## srt-mio
 
 - `SrtSocket::connect(local, remote, cfg)`: non-blocking; the handshake
@@ -260,7 +310,13 @@ Where we differ from libsrt (wire-compatible: only *when* NAKs go):
   `SrtSocket` is a `mio::event::Source` (its UDP socket).
 - `SrtListener::bind(addr, cfg)`: one UDP socket, demux by destination socket
   ID (0 -> the core `Listener`), connections in a map; `accept()` yields new
-  connection ids; `send/recv/stats/close` by id.
+  connection ids; `send/recv/stats/close` by id. Timers: each connection's
+  deadline is filed in a min-heap (lazy deletion); a connection touched by
+  a datagram, its timer or a call is marked dirty, and `drive_io` handles
+  only the dirty and due ones, then re-files their deadlines: a wake-up is
+  O(touched + due x log n), not a scan of every connection.
+- `SrtSocketSet`: many callers (a fan-out sender) with one timer heap, the
+  same dirty/due rule; the bench's sender uses it.
 - I/O: `recvmmsg` up to 64 datagrams per call, `sendmmsg` up to 64 per call,
   buffers preallocated; unsent datagrams stay queued on `EAGAIN`.
 - Timers: `poll_timeout()` from the core arms a `timerfd` (`SrtTimer`, a mio
@@ -292,4 +348,4 @@ UNSECURE (1011).
 2. (done) NAK (per-loss schedule), retransmission, sender drop, tail probe
    (spec 12).
 3. (done) FEC filter.
-4. GSO/GRO, O(1) listener timeouts, encryption.
+4. GSO/GRO, encryption. (Listener and fan-out timer heaps: done.)

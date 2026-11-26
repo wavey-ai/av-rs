@@ -37,7 +37,11 @@ pub(crate) fn udp_socket(bind: SocketAddr, opts: &UdpOptions) -> io::Result<(std
     if let Some(n) = opts.send_buffer {
         let _ = s.set_send_buffer_size(n);
     }
-    if opts.reuse_address {
+    // only for a fixed port: with SO_REUSEADDR on an ephemeral bind (port
+    // 0) Linux may hand out a UDP port another SO_REUSEADDR socket already
+    // has; two callers to the same listener from one port then get each
+    // other's datagrams (one never connects)
+    if opts.reuse_address && bind.port() != 0 {
         s.set_reuse_address(true)?;
     }
     s.set_nonblocking(true)?;

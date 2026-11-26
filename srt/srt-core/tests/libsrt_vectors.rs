@@ -331,8 +331,12 @@ fn our_listener_against_libsrt_caller_bytes() {
         }
         let mut d = p.bytes.clone();
         d[12..16].copy_from_slice(&sid.to_be_bytes());
-        conn.handle_datagram(t0, caller, &d);
-        let due = t0 + Duration::from_micros((h.timestamp - conc_hdr.timestamp) as u64 + 120_000);
+        // each packet arrives at its own time (as sent, no extra delay); a
+        // packet arriving earlier than the base predicts would move the base
+        // (tsbpd_settle_ms)
+        let sent = t0 + Duration::from_micros((h.timestamp - conc_hdr.timestamp) as u64);
+        conn.handle_datagram(sent, caller, &d);
+        let due = sent + Duration::from_micros(120_000);
         assert!(conn.recv_message(due - Duration::from_micros(1)).is_none());
         let m = conn.recv_message(due).expect("due");
         assert_eq!(m.payload, &p.bytes[16..]);

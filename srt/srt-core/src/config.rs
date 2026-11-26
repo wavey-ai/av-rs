@@ -56,6 +56,12 @@ pub struct Config {
     pub snd_drop_delay_ms: i32,
     /// [SRTO_DRIFTTRACER]
     pub drift_tracer: bool,
+    /// For this long after the TSBPD base is set (from the handshake
+    /// packet), a data packet that arrives earlier than the base predicts
+    /// moves the base back to it, so a delayed handshake (jitter) does not
+    /// delay every packet of the connection. 0 = off (libsrt's rule). Not
+    /// an SRT option (receiver timing).
+    pub tsbpd_settle_ms: u32,
     /// [SRTO_LOSSMAXTTL]: reorder tolerance in packets before a gap is
     /// NAKed (0 = NAK at once). Ours is also bounded in time by
     /// `reorder_window_us`.
@@ -63,6 +69,14 @@ pub struct Config {
     /// With `loss_max_ttl` > 0, NAK a gap after at most this long even if
     /// fewer packets arrived (spec 12 #14). Not an SRT option.
     pub reorder_window_us: u32,
+    /// With `loss_max_ttl` 0 (libsrt's default, the bench's setting): when
+    /// an original (not retransmitted) packet fills a hole, the path
+    /// reorders; new holes then wait the observed reorder lateness (max over
+    /// the current and previous 1 s, capped at min(latency / 8,
+    /// max(SRTT / 2, 2 ms))) before their first NAK, instead of a NAK and a
+    /// needless retransmission per reordered packet. Back to 0 two seconds
+    /// after the last reordering. Not an SRT option (receiver-side timing).
+    pub auto_reorder: bool,
     /// Sender tail probe (spec 12 #5): when the newest packets stay
     /// unacknowledged for SRTT + 4 RTTVar + one ACK period and nothing newer
     /// is queued, retransmit the newest one so a lost tail is seen at once.
@@ -76,6 +90,13 @@ pub struct Config {
     /// Costs a small NAK per NAK and a copy for about loss% of repairs.
     /// Not an SRT option; wire-compatible (duplicates are dropped).
     pub repair_copies: bool,
+    /// Tail, head and stall probes wait at least the peer's measured ACK
+    /// hold-off (how long after the newest packet arrives its ACK comes:
+    /// ours <= 10 ms, libsrt's up to ~20 ms when its receive worker idles
+    /// between frames), capped at latency / 2, instead of one ACK period.
+    /// Without it a probe toward a slow-ACKing peer is mostly a duplicate.
+    /// Not an SRT option.
+    pub probe_ack_lag: bool,
     /// ACKs report RTTVar >= SRTT / 4. A libsrt sender (RETRANSMITALGO=1)
     /// then serves every NAK instead of dropping requests that arrive
     /// within SRTT - 4 RTTVar of its last copy: our receiver paces its own
@@ -161,10 +182,13 @@ impl Default for Config {
             tlpktdrop: true,
             snd_drop_delay_ms: 0,
             drift_tracer: true,
+            tsbpd_settle_ms: 1000,
             loss_max_ttl: 0,
             reorder_window_us: 2000,
+            auto_reorder: true,
             tail_probe: true,
             repair_copies: true,
+            probe_ack_lag: true,
             ack_rttvar_floor: true,
             pace_quantum_us: 250,
             fec_ack_head_delay_us: -1,

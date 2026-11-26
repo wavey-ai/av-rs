@@ -20,6 +20,16 @@ pub struct Tsbpd {
     drift_n: u32,
     first_rtt_us: Option<i64>,
     drift_tracer: bool,
+    /// Until this local time, the base moves earlier to the least-delayed
+    /// data packet seen (`settle`); None = off or not started.
+    settle_until_us: Option<i64>,
+    /// Armed settle window (µs), opened by the first data packet: data may
+    /// start long after the handshake (an application connects first).
+    settle_window_us: Option<i64>,
+    /// How far the settle moved the base so far (capped at latency / 8: on
+    /// a jittery path the fastest packet can be well below the mean delay,
+    /// and every µs moved is taken from the repair budget of slower ones).
+    settled_us: i64,
 }
 
 impl Tsbpd {
@@ -35,6 +45,49 @@ impl Tsbpd {
             drift_n: 0,
             first_rtt_us: None,
             drift_tracer,
+            settle_until_us: None,
+            settle_window_us: None,
+            settled_us: 0,
+        }
+    }
+
+    /// Refine the base from data packets for `window_us` after `now_us`:
+    /// the handshake packet the base comes from may itself have been
+    /// delayed (jitter, queueing), and then every packet plays that much
+    /// late for the whole connection (libsrt has the same rule and the
+    /// same weakness; its drift tracer moves only after 1000 samples and
+    /// at most 5 ms per step).
+    pub fn settle_for(&mut self, _now_us: i64, window_us: i64) {
+        self.settle_window_us = (window_us > 0).then_some(window_us);
+        self.settle_until_us = None;
+    }
+
+    /// An original (not retransmitted) data packet with timestamp `ts`
+    /// arrived at `arrival_us`: during the settle window (opened by the
+    /// first data packet), a packet earlier
+    /// than the base says moves the base back to it (never later). Returns
+    /// how far the base moved (µs, >= 0).
+    #[inline]
+    pub fn observe_arrival(&mut self, ts: u32, arrival_us: i64) -> i64 {
+        if let Some(w) = self.settle_window_us.take() {
+            // the window opens with the first data packet
+            self.settle_until_us = Some(arrival_us + w);
+        }
+        match self.settle_until_us {
+            Some(t) if arrival_us <= t => {
+                let early = (self.base_time_us(ts) - arrival_us).min(self.latency_us / 8 - self.settled_us);
+                if early > 0 {
+                    self.base_us -= early;
+                    self.settled_us += early;
+                    return early;
+                }
+                0
+            }
+            Some(_) => {
+                self.settle_until_us = None;
+                0
+            }
+            None => 0,
         }
     }
 
@@ -106,6 +159,38 @@ impl Tsbpd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settle_moves_the_base_earlier_only_within_the_window() {
+        // the handshake came 12 ms late: base 12 ms too late
+        let mut t = Tsbpd::new(1_012_000, 0, 100, false);
+        t.settle_for(1_012_000, 1_000_000);
+        // a data packet stamped 10 ms after the handshake arrives on time (owd as the
+        // undelayed handshake would have had): 12 ms earlier than the base says
+        assert_eq!(t.observe_arrival(10_000, 1_010_000), 12_000);
+        assert_eq!(t.due_us(10_000), 1_010_000 + 100_000);
+        // a later (more delayed) packet does not move it back
+        assert_eq!(t.observe_arrival(20_000, 1_025_000), 0);
+        assert_eq!(t.due_us(20_000), 1_020_000 + 100_000);
+        // after the window nothing moves
+        assert_eq!(t.observe_arrival(1_500_000, 2_400_000), 0);
+        assert_eq!(t.observe_arrival(1_600_000, 2_500_000), 0);
+        // data that starts 5 s after the handshake still settles the base
+        let mut t = Tsbpd::new(1_012_000, 0, 200, false);
+        t.settle_for(1_012_000, 1_000_000);
+        assert_eq!(t.observe_arrival(5_000_000, 6_000_000), 12_000);
+        assert_eq!(t.observe_arrival(5_500_000, 6_499_000), 1_000);
+        assert_eq!(t.observe_arrival(6_100_000, 7_090_000), 0);
+    }
+
+    #[test]
+    fn settle_is_capped_at_an_eighth_of_the_latency() {
+        let mut t = Tsbpd::new(1_030_000, 0, 120, false);
+        t.settle_for(1_030_000, 1_000_000);
+        // the fastest packet is 30 ms ahead of the base: only 15 ms are taken
+        assert_eq!(t.observe_arrival(10_000, 1_010_000), 15_000);
+        assert_eq!(t.observe_arrival(20_000, 1_015_000), 0);
+    }
 
     #[test]
     fn due_time_is_base_plus_ts_plus_latency() {

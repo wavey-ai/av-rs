@@ -10,14 +10,17 @@
 //! `recv_with`. Do not register WRITABLE: on UDP every packet the kernel
 //! frees raises a new EPOLLOUT edge, i.e. one wake-up per packet sent; if
 //! `pending_datagrams() > 0` (EAGAIN) retry on a short timer instead.
-//! See srt-core's DESIGN.md.
+//! `SrtSocketSet` drives many callers (a fan-out sender) from one timer
+//! heap. See srt-core's DESIGN.md.
 
 pub mod batch;
 mod listener;
+mod set;
 mod socket;
 mod timer;
 
 pub use listener::SrtListener;
+pub use set::SrtSocketSet;
 pub use socket::SrtSocket;
 pub use srt_core;
 pub use timer::SrtTimer;
@@ -29,6 +32,8 @@ pub struct UdpOptions {
     pub recv_buffer: Option<usize>,
     /// SO_SNDBUF request.
     pub send_buffer: Option<usize>,
+    /// SO_REUSEADDR, applied only when binding a fixed port (never to an
+    /// ephemeral port-0 bind, where it lets Linux reuse a port in use).
     pub reuse_address: bool,
 }
 

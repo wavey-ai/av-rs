@@ -1,5 +1,14 @@
 //! SRT listener: one UDP socket, connections demultiplexed by destination
 //! socket ID (0 goes to the handshake acceptor).
+//!
+//! Timers: each connection's `poll_timeout` is cached in a min-heap (lazy
+//! deletion: an entry counts only while it equals the connection's cached
+//! deadline). A connection is *dirty* once anything may have changed its
+//! deadline or given it something to send (a datagram for it, its timer,
+//! a call through `send`, `recv_with`, `close`, `connection_mut`); `drive_io`
+//! runs the due timers from the heap, flushes only dirty connections and
+//! re-files their deadlines. A wake-up costs O(dirty + due x log n), not
+//! O(connections).
 
 use crate::batch::{RecvBatch, SendBatch};
 use crate::socket::udp_socket;
@@ -8,7 +17,8 @@ use mio::event::Source;
 use mio::{Interest, Registry, Token};
 use srt_core::packet::dst_socket_id;
 use srt_core::{AcceptCallback, AcceptSecretCallback, Config, Connection, Delivered, Listener, ListenerAction, SendError};
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
@@ -16,10 +26,21 @@ use std::time::Instant;
 
 const MAX_RECV_PER_DRIVE: usize = 1024;
 
+struct Slot {
+    conn: Connection,
+    /// The deadline filed in the heap (None: no timer).
+    due: Option<Instant>,
+    dirty: bool,
+}
+
 pub struct SrtListener {
     sock: mio::net::UdpSocket,
     acceptor: Listener,
-    conns: HashMap<u32, Connection>,
+    conns: HashMap<u32, Slot>,
+    /// (deadline, connection id), earliest first; stale entries are skipped.
+    timers: BinaryHeap<Reverse<(Instant, u32)>>,
+    /// Connections whose deadline or output may have changed since `drive_io`.
+    dirty: Vec<u32>,
     order: Vec<u32>,
     accept_q: VecDeque<u32>,
     backlog: usize,
@@ -31,6 +52,10 @@ pub struct SrtListener {
     pub unknown_dst: u64,
     pub recv_calls: u64,
     pub recv_datagrams: u64,
+    /// Datagrams read by the last `drive_io` that read the socket.
+    pub last_read: usize,
+    /// Coalescing pauses taken (`coalesce_delay` returned Some).
+    pub coalesce_pauses: u64,
     may_read: bool,
 }
 
@@ -42,6 +67,8 @@ impl SrtListener {
             sock: mio::net::UdpSocket::from_std(s),
             acceptor: Listener::new(cfg, Instant::now()),
             conns: HashMap::new(),
+            timers: BinaryHeap::new(),
+            dirty: Vec::new(),
             order: Vec::new(),
             accept_q: VecDeque::new(),
             backlog: 64,
@@ -52,6 +79,8 @@ impl SrtListener {
             unknown_dst: 0,
             recv_calls: 0,
             recv_datagrams: 0,
+            last_read: 0,
+            coalesce_pauses: 0,
             may_read: true,
         })
     }
@@ -87,11 +116,15 @@ impl SrtListener {
     }
 
     pub fn connection(&self, id: u32) -> Option<&Connection> {
-        self.conns.get(&id)
+        self.conns.get(&id).map(|s| &s.conn)
     }
 
+    /// Mutable access marks the connection dirty (its timers are re-read
+    /// and its output flushed on the next `drive_io`/`flush`).
     pub fn connection_mut(&mut self, id: u32) -> Option<&mut Connection> {
-        self.conns.get_mut(&id)
+        let s = self.conns.get_mut(&id)?;
+        mark(&mut self.dirty, id, s);
+        Some(&mut s.conn)
     }
 
     pub fn connection_ids(&self) -> &[u32] {
@@ -103,17 +136,23 @@ impl SrtListener {
         self.acceptor.remove(id);
         self.order.retain(|&x| x != id);
         self.accept_q.retain(|&x| x != id);
-        self.conns.remove(&id)
+        self.dirty.retain(|&x| x != id);
+        self.conns.remove(&id).map(|s| s.conn)
     }
 
     pub fn send(&mut self, id: u32, now: Instant, msg: &[u8]) -> Result<u32, SendError> {
-        self.conns.get_mut(&id).ok_or(SendError::NotConnected)?.send_message(now, msg, None)
+        let s = self.conns.get_mut(&id).ok_or(SendError::NotConnected)?;
+        mark(&mut self.dirty, id, s);
+        s.conn.send_message(now, msg, None)
     }
 
     pub fn recv_with<F: FnMut(&Delivered<'_>)>(&mut self, id: u32, now: Instant, mut f: F) -> usize {
-        let Some(c) = self.conns.get_mut(&id) else { return 0 };
+        let Some(s) = self.conns.get_mut(&id) else { return 0 };
+        // reading may drop too-late packets and so move the deadline even
+        // when nothing is delivered
+        mark(&mut self.dirty, id, s);
         let mut n = 0;
-        while let Some(m) = c.recv_message(now) {
+        while let Some(m) = s.conn.recv_message(now) {
             f(&m);
             n += 1;
         }
@@ -121,8 +160,9 @@ impl SrtListener {
     }
 
     pub fn close(&mut self, id: u32, now: Instant) -> io::Result<()> {
-        if let Some(c) = self.conns.get_mut(&id) {
-            c.close(now);
+        if let Some(s) = self.conns.get_mut(&id) {
+            mark(&mut self.dirty, id, s);
+            s.conn.close(now);
         }
         self.flush(now)
     }
@@ -144,9 +184,24 @@ impl SrtListener {
         if self.may_read {
             self.recv(now)?;
         }
-        for c in self.conns.values_mut() {
-            if c.poll_timeout().map_or(false, |t| t <= now) {
-                c.handle_timeout(now);
+        while let Some(&Reverse((t, id))) = self.timers.peek() {
+            if t > now {
+                break;
+            }
+            self.timers.pop();
+            let Some(s) = self.conns.get_mut(&id) else { continue };
+            if s.due != Some(t) {
+                continue; // stale: re-filed since
+            }
+            s.due = None;
+            mark(&mut self.dirty, id, s);
+        }
+        // every dirty connection: its timers if due, then (in flush) its output
+        for &id in &self.dirty {
+            if let Some(s) = self.conns.get_mut(&id) {
+                if s.conn.poll_timeout().map_or(false, |t| t <= now) {
+                    s.conn.handle_timeout(now);
+                }
             }
         }
         self.flush(now)
@@ -178,20 +233,23 @@ impl SrtListener {
                         }
                         ListenerAction::Accept(c) => {
                             let id = c.local_socket_id();
-                            self.conns.insert(id, *c);
+                            self.conns.insert(id, Slot { conn: *c, due: None, dirty: true });
+                            self.dirty.push(id);
                             self.order.push(id);
                             self.accept_q.push_back(id);
                             self.acceptor.set_backlog_full(self.accept_q.len() >= self.backlog);
                         }
                         ListenerAction::Existing(id) => {
-                            if let Some(c) = self.conns.get_mut(&id) {
-                                c.handle_datagram(now, from, d);
+                            if let Some(s) = self.conns.get_mut(&id) {
+                                mark(&mut self.dirty, id, s);
+                                s.conn.handle_datagram(now, from, d);
                             }
                         }
                         ListenerAction::Ignore => {}
                     }
-                } else if let Some(c) = self.conns.get_mut(&dst) {
-                    c.handle_datagram(now, from, d);
+                } else if let Some(s) = self.conns.get_mut(&dst) {
+                    mark(&mut self.dirty, dst, s);
+                    s.conn.handle_datagram(now, from, d);
                 } else {
                     self.unknown_dst += 1;
                 }
@@ -203,27 +261,83 @@ impl SrtListener {
                 break;
             }
         }
+        self.last_read = total;
         Ok(())
     }
 
-    /// Send what every connection has due.
+    /// Read coalescing for a peer that paces packet by packet (libsrt
+    /// sends each packet on its own): after a small read (< `min_batch`
+    /// datagrams), wait `delay` before the next poll, so the next
+    /// `recvmmsg` takes a batch instead of one wake-up per 1-3 packets.
+    /// `delay` = min(SRTT / 16, `max`) of the first connection with an RTT
+    /// sample; None when that is zero, when a timer is due before it
+    /// ends, or when datagrams are queued to send. The pause delays only
+    /// reading (ACKs and NAKs by <= SRTT / 16); TSBPD delivery and timers
+    /// keep their times. Call after `drive_io`, before polling; sleep the
+    /// returned duration.
+    pub fn coalesce_delay(&mut self, now: Instant, min_batch: usize, max: std::time::Duration) -> Option<std::time::Duration> {
+        if self.last_read == 0 || self.last_read >= min_batch || self.tx.pending() > 0 {
+            return None;
+        }
+        let rtt = self.conns.values().map(|s| s.conn.rtt_us()).find(|r| r.1)?.0;
+        let d = std::time::Duration::from_micros(rtt as u64 / 16).min(max);
+        if d.is_zero() || self.poll_timeout().map_or(false, |t| t <= now + d) {
+            return None;
+        }
+        self.last_read = 0;
+        self.coalesce_pauses += 1;
+        Some(d)
+    }
+
+    /// Send what the dirty connections have due (a connection whose pacer
+    /// holds data back has that in its deadline), then re-file their
+    /// deadlines. On EAGAIN the rest stay dirty for the next call.
     pub fn flush(&mut self, now: Instant) -> io::Result<()> {
         let fd = self.sock.as_raw_fd();
-        for id in &self.order {
-            let Some(c) = self.conns.get_mut(id) else { continue };
-            let dst = c.peer_addr();
-            loop {
-                if self.tx.is_full() && !self.tx.flush(fd)? {
-                    return Ok(()); // would block
+        let mut done = 0;
+        let mut blocked = false;
+        'conns: for &id in &self.dirty {
+            if let Some(s) = self.conns.get_mut(&id) {
+                let dst = s.conn.peer_addr();
+                loop {
+                    if self.tx.is_full() && !self.tx.flush(fd)? {
+                        blocked = true; // would block: this one and the rest stay dirty
+                        break 'conns;
+                    }
+                    let Some(slot) = self.tx.slot() else { break };
+                    match s.conn.poll_transmit(now, slot) {
+                        Some(t) => self.tx.commit(t.len, Some(&dst)),
+                        None => break,
+                    }
                 }
-                let Some(slot) = self.tx.slot() else { break };
-                match c.poll_transmit(now, slot) {
-                    Some(t) => self.tx.commit(t.len, Some(&dst)),
-                    None => break,
+                s.dirty = false;
+                let due = s.conn.poll_timeout();
+                if due != s.due {
+                    s.due = due;
+                    if let Some(t) = due {
+                        self.timers.push(Reverse((t, id)));
+                    }
+                }
+            }
+            done += 1;
+        }
+        self.dirty.drain(..done);
+        if !blocked {
+            self.tx.flush(fd)?;
+        }
+        // drop stale heap tops so `poll_timeout` can peek
+        while let Some(&Reverse((t, id))) = self.timers.peek() {
+            match self.conns.get(&id) {
+                Some(s) if s.due == Some(t) => break,
+                _ => {
+                    self.timers.pop();
                 }
             }
         }
-        self.tx.flush(fd)?;
+        // a heap of mostly stale entries is rebuilt from the live deadlines
+        if self.timers.len() > 64 + 4 * self.conns.len() {
+            self.timers = self.conns.iter().filter_map(|(&id, s)| s.due.map(|t| Reverse((t, id)))).collect();
+        }
         Ok(())
     }
 
@@ -239,9 +353,30 @@ impl SrtListener {
         &self.rx
     }
 
-    /// Earliest timer of any connection.
+    /// Earliest timer of any connection: the heap's top (valid after
+    /// `drive_io`/`flush`), or now-ish for a connection touched since (dirty
+    /// ones are read directly).
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.conns.values().filter_map(|c| c.poll_timeout()).min()
+        let mut t = self.timers.peek().map(|r| r.0 .0);
+        for id in &self.dirty {
+            if let Some(d) = self.conns.get(id).and_then(|s| s.conn.poll_timeout()) {
+                t = Some(t.map_or(d, |x| x.min(d)));
+            }
+        }
+        t
+    }
+
+    /// Connections with a filed timer (for tests and stats).
+    pub fn timer_entries(&self) -> usize {
+        self.timers.len()
+    }
+}
+
+#[inline]
+fn mark(dirty: &mut Vec<u32>, id: u32, s: &mut Slot) {
+    if !s.dirty {
+        s.dirty = true;
+        dirty.push(id);
     }
 }
 
