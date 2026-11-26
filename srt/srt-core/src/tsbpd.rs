@@ -21,8 +21,11 @@ pub struct Tsbpd {
     first_rtt_us: Option<i64>,
     drift_tracer: bool,
     /// Until this local time, the base moves earlier to the least-delayed
-    /// data packet seen (`settle`); None = off.
+    /// data packet seen (`settle`); None = off or not started.
     settle_until_us: Option<i64>,
+    /// Armed settle window (µs), opened by the first data packet: data may
+    /// start long after the handshake (an application connects first).
+    settle_window_us: Option<i64>,
 }
 
 impl Tsbpd {
@@ -39,6 +42,7 @@ impl Tsbpd {
             first_rtt_us: None,
             drift_tracer,
             settle_until_us: None,
+            settle_window_us: None,
         }
     }
 
@@ -48,16 +52,22 @@ impl Tsbpd {
     /// late for the whole connection (libsrt has the same rule and the
     /// same weakness; its drift tracer moves only after 1000 samples and
     /// at most 5 ms per step).
-    pub fn settle_for(&mut self, now_us: i64, window_us: i64) {
-        self.settle_until_us = Some(now_us + window_us);
+    pub fn settle_for(&mut self, _now_us: i64, window_us: i64) {
+        self.settle_window_us = (window_us > 0).then_some(window_us);
+        self.settle_until_us = None;
     }
 
     /// An original (not retransmitted) data packet with timestamp `ts`
-    /// arrived at `arrival_us`: during the settle window, a packet earlier
+    /// arrived at `arrival_us`: during the settle window (opened by the
+    /// first data packet), a packet earlier
     /// than the base says moves the base back to it (never later). Returns
     /// how far the base moved (µs, >= 0).
     #[inline]
     pub fn observe_arrival(&mut self, ts: u32, arrival_us: i64) -> i64 {
+        if let Some(w) = self.settle_window_us.take() {
+            // the window opens with the first data packet
+            self.settle_until_us = Some(arrival_us + w);
+        }
         match self.settle_until_us {
             Some(t) if arrival_us <= t => {
                 let early = self.base_time_us(ts) - arrival_us;
@@ -159,6 +169,12 @@ mod tests {
         // after the window nothing moves
         assert_eq!(t.observe_arrival(1_500_000, 2_400_000), 0);
         assert_eq!(t.observe_arrival(1_600_000, 2_500_000), 0);
+        // data that starts 5 s after the handshake still settles the base
+        let mut t = Tsbpd::new(1_012_000, 0, 100, false);
+        t.settle_for(1_012_000, 1_000_000);
+        assert_eq!(t.observe_arrival(5_000_000, 6_000_000), 12_000);
+        assert_eq!(t.observe_arrival(5_500_000, 6_499_000), 1_000);
+        assert_eq!(t.observe_arrival(6_100_000, 7_090_000), 0);
     }
 
     #[test]

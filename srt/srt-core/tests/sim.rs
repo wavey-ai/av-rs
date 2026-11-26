@@ -1704,6 +1704,9 @@ fn tsbpd_base_settles_after_a_delayed_handshake() {
         let mut s = Sim::new(cfg(120), l, 15, 300);
         s.delay = Box::new(|side, d| if side == "a" && ctl_type(d) == Some(0) { Duration::from_millis(12) } else { Duration::ZERO });
         s.connect();
+        // the application starts sending 3 s after connecting (the bench's T0 lead):
+        // the settle window opens with the first data packet, not at the handshake
+        s.run_until(Duration::from_secs(3), |_| false);
         let (lat, missing) = run_frames(&mut s, 30, 20, Duration::from_millis(40), Duration::from_millis(400));
         assert_eq!(missing, 0);
         let max = *lat.iter().max().unwrap();
